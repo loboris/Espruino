@@ -20,9 +20,17 @@
 // jshGetDeviceObjectFor
 #include "jswrapper.h"
 
-#if defined(PICO) || defined(NUCLEOF401RE) || defined(NUCLEOF411RE)
+#if defined(PICO) || defined(ESPRUINOWIFI) || defined(NUCLEOF401RE) || defined(NUCLEOF411RE)
 #define PIN_NAMES_DIRECT // work out pin names directly from port + pin in pinInfo
 #endif
+
+// ----------------------------------------------------------------------------
+
+// Whether a pin's state has been set manually or not
+BITFIELD_DECL(jshPinStateIsManual, JSH_PIN_COUNT);
+
+// ----------------------------------------------------------------------------
+
 
 /**
  * Validate that the pin is a good pin.
@@ -184,7 +192,7 @@ void jshGetPinString(char *result, Pin pin) {
 #endif
 #endif
     } else {
-      strncpy(result, "UNKNOWN", 8);
+      strncpy(result, "undefined", 8);
     }
   }
 
@@ -209,9 +217,6 @@ Pin jshGetPinFromVarAndUnLock(JsVar *pinv) {
 
   // ----------------------------------------------------------------------------
 
-  // Whether a pin's state has been set manually or not
-BITFIELD_DECL(jshPinStateIsManual, JSH_PIN_COUNT); // TODO: This should be set to all 0
-
 bool jshGetPinStateIsManual(Pin pin) {
   return BITFIELD_GET(jshPinStateIsManual, pin);
 }
@@ -219,6 +224,12 @@ bool jshGetPinStateIsManual(Pin pin) {
 void jshSetPinStateIsManual(Pin pin, bool manual) {
   BITFIELD_SET(jshPinStateIsManual, pin, manual);
 }
+
+// Reset our list of which pins are set manually - called from jshResetDevices
+void jshResetPinStateIsManual() {
+  BITFIELD_CLEAR(jshPinStateIsManual);
+}
+
 
   // ----------------------------------------------------------------------------
 
@@ -338,7 +349,7 @@ void jshPinFunctionToString(JshPinFunction pinFunc, JshPinFunctionToStringFlags 
   const char *infoStr = 0;
   buf[0]=0;
   if (JSH_PINFUNCTION_IS_USART(pinFunc)) {
-    devStr="USART";
+    devStr=(flags&JSPFTS_JS_NAMES)?"Serial":"USART";
     firstDevice=JSH_USART1;
     if (info==JSH_USART_RX) infoStr="RX";
     else if (info==JSH_USART_TX) infoStr="TX";
@@ -447,7 +458,7 @@ JsVar *jshGetDeviceObjectFor(JshPinFunction deviceMin, JshPinFunction deviceMax,
   JshPinFunction dev = jshGetDeviceFor(deviceMin, deviceMax, pin);
   if (dev==JSH_NOTHING) return 0;
   char devName[16];
-  jshPinFunctionToString(dev, JSPFTS_DEVICE|JSPFTS_DEVICE_NUMBER, devName, sizeof(devName));
+  jshPinFunctionToString(dev, JSPFTS_DEVICE|JSPFTS_DEVICE_NUMBER|JSPFTS_JS_NAMES, devName, sizeof(devName));
   JsVar *devVar = jsvObjectGetChild(execInfo.root, devName, 0);
   if (devVar) return devVar;
   return jswFindBuiltInFunction(0, devName);

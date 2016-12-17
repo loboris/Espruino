@@ -42,8 +42,7 @@ bool jsiFreeMoreMemory();
 bool jsiHasTimers(); // are there timers still left to run?
 bool jsiIsWatchingPin(Pin pin); // are there any watches for the given pin?
 
-
-void jsiHandleIOEventForUSART(JsVar *usartClass, IOEvent *event); ///< Called from idle loop
+void jsiCtrlC(); // Ctrl-C - force interrupt of execution
 
 /// Queue a function, string, or array (of funcs/strings) to be executed next time around the idle loop
 void jsiQueueEvents(JsVar *object, JsVar *callback, JsVar **args, int argCount);
@@ -51,6 +50,8 @@ void jsiQueueEvents(JsVar *object, JsVar *callback, JsVar **args, int argCount);
 bool jsiObjectHasCallbacks(JsVar *object, const char *callbackName);
 /// Queue up callbacks for other things (touchscreen? network?)
 void jsiQueueObjectCallbacks(JsVar *object, const char *callbackName, JsVar **args, int argCount);
+/// Execute callbacks straight away (like jsiQueueObjectCallbacks, but without queueing)
+void jsiExecuteObjectCallbacks(JsVar *object, const char *callbackName, JsVar **args, int argCount);
 /// Execute the given function/string/array of functions and return true on success, false on failure (break during execution)
 bool jsiExecuteEventCallback(JsVar *thisVar, JsVar *callbackVar, unsigned int argCount, JsVar **argPtr);
 /// Same as above, but with a JsVarArray (this calls jsiExecuteEventCallback, so use jsiExecuteEventCallback where possible)
@@ -60,20 +61,39 @@ bool jsiExecuteEventCallbackArgsArray(JsVar *thisVar, JsVar *callbackVar, JsVar 
 IOEventFlags jsiGetDeviceFromClass(JsVar *deviceClass);
 JsVar *jsiGetClassNameFromDevice(IOEventFlags device);
 
-/// Change the console to a new location
-void jsiSetConsoleDevice(IOEventFlags device);
+/** Change the console to a new location - if force is set, this console
+ * device will be 'sticky' - it will not change when the device changes
+ * connection state */
+void jsiSetConsoleDevice(IOEventFlags device, bool force);
 /// Get the device that the console is currently on
 IOEventFlags jsiGetConsoleDevice();
+/// is the console forced into a given place (See jsiSetConsoleDevice)
+bool jsiIsConsoleDeviceForced();
 /// Transmit a byte
 void jsiConsolePrintChar(char data);
-/// Transmit a string
-void jsiConsolePrint(const char *str);
+/// Transmit a string (may be any string)
+void jsiConsolePrintString(const char *str);
+#ifndef USE_FLASH_MEMORY
+#define jsiConsolePrint jsiConsolePrintString
 /// Write the formatted string to the console (see vcbprintf)
 void jsiConsolePrintf(const char *fmt, ...);
+#else
+/// Write the formatted string to the console (see vcbprintf), but place the format string into
+// into flash
+#define jsiConsolePrintf(fmt, ...) do { \
+    FLASH_STR(flash_str, fmt); \
+    jsiConsolePrintf_int(flash_str, ##__VA_ARGS__); \
+  } while(0)
+void jsiConsolePrintf_int(const char *fmt, ...);
+/// Transmit a string (must be a literal string)
+#define jsiConsolePrint(str) do { \
+    FLASH_STR(flash_str, str); \
+    jsiConsolePrintString_int(flash_str); \
+} while(0)
+void jsiConsolePrintString_int(const char *str);
+#endif
 /// Print the contents of a string var - directly
 void jsiConsolePrintStringVar(JsVar *v);
-/// Transmit a position in the lexer (for reporting errors)
-void jsiConsolePrintPosition(struct JsLex *lex, size_t tokenPos);
 /// If the input line was shown in the console, remove it
 void jsiConsoleRemoveInputLine();
 /// Change what is in the inputline into something else (and update the console)
@@ -104,6 +124,7 @@ void jsiSetSleep(JsiSleepType isSleep);
 #define USART_BAUDRATE_NAME "_baudrate"
 #define DEVICE_OPTIONS_NAME "_options"
 #define INIT_CALLBACK_NAME JS_EVENT_PREFIX"init" ///< Callback for `E.on('init'`
+#define PASSWORD_VARIABLE_NAME "pwd"
 
 typedef enum {
   JSIS_NONE,
@@ -117,11 +138,14 @@ typedef enum {
 #endif
   JSIS_TODO_FLASH_SAVE = 64, // save to flash
   JSIS_TODO_FLASH_LOAD = 128, // load from flash
-  JSIS_TODO_RESET = JSIS_TODO_FLASH_SAVE|JSIS_TODO_FLASH_LOAD, // reset the board, don't load anything
+  JSIS_TODO_RESET = 256, // reset the board, don't load anything
   JSIS_TODO_MASK = JSIS_TODO_FLASH_SAVE|JSIS_TODO_FLASH_LOAD|JSIS_TODO_RESET,
+  JSIS_CONSOLE_FORCED = 512, // see jsiSetConsoleDevice
+  JSIS_WATCHDOG_AUTO = 1024, // Automatically kick the watchdog timer on idle
+  JSIS_PASSWORD_PROTECTED = 2048, // Password protected
 
-
-  JSIS_ECHO_OFF_MASK = JSIS_ECHO_OFF|JSIS_ECHO_OFF_FOR_LINE
+  JSIS_ECHO_OFF_MASK = JSIS_ECHO_OFF|JSIS_ECHO_OFF_FOR_LINE,
+  JSIS_SOFTINIT_MASK = JSIS_PASSWORD_PROTECTED // stuff that DOESN'T get reset on softinit
 } PACKED_FLAGS JsiStatus;
 
 extern JsiStatus jsiStatus;

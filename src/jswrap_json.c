@@ -53,7 +53,7 @@ JsVar *jswrap_json_stringify(JsVar *v) {
 }
 
 
-JsVar *jswrap_json_parse_internal(JsLex *lex) {
+JsVar *jswrap_json_parse_internal() {
   switch (lex->tk) {
   case LEX_R_TRUE:  jslGetNextToken(lex); return jsvNewFromBool(true);
   case LEX_R_FALSE: jslGetNextToken(lex); return jsvNewFromBool(false);
@@ -83,41 +83,41 @@ JsVar *jswrap_json_parse_internal(JsLex *lex) {
     return a;
   }
   case '[': {
-    JsVar *arr = jsvNewWithFlags(JSV_ARRAY); if (!arr) return 0;
+    JsVar *arr = jsvNewEmptyArray(); if (!arr) return 0;
     jslGetNextToken(lex); // [
     while (lex->tk != ']') {
       JsVar *value = jswrap_json_parse_internal(lex);
       if (!value ||
-          (lex->tk!=']' && !jslMatch(lex, ','))) {
+          (lex->tk!=']' && !jslMatch(','))) {
         jsvUnLock2(value, arr);
         return 0;
       }
       jsvArrayPush(arr, value);
       jsvUnLock(value);
     }
-    if (!jslMatch(lex, ']')) {
+    if (!jslMatch(']')) {
       jsvUnLock(arr);
       return 0;
     }
     return arr;
   }
   case '{': {
-    JsVar *obj = jsvNewWithFlags(JSV_OBJECT); if (!obj) return 0;
+    JsVar *obj = jsvNewObject(); if (!obj) return 0;
     jslGetNextToken(lex); // {
     while (lex->tk == LEX_STR) {
       JsVar *key = jsvAsArrayIndexAndUnLock(jslGetTokenValueAsVar(lex));
       jslGetNextToken(lex);
       JsVar *value = 0;
-      if (!jslMatch(lex, ':') ||
+      if (!jslMatch(':') ||
           !(value=jswrap_json_parse_internal(lex)) ||
-          (lex->tk!='}' && !jslMatch(lex, ','))) {
+          (lex->tk!='}' && !jslMatch(','))) {
         jsvUnLock3(key, value, obj);
         return 0;
       }
       jsvAddName(obj, jsvMakeIntoVariableName(key, value));
       jsvUnLock2(value, key);
     }
-    if (!jslMatch(lex, '}')) {
+    if (!jslMatch('}')) {
       jsvUnLock(obj);
       return 0;
     }
@@ -144,10 +144,12 @@ NOTE: This implementation uses eval() internally, and as such it is unsafe as it
 JsVar *jswrap_json_parse(JsVar *v) {
   JsLex lex;
   JsVar *str = jsvAsString(v, false);
-  jslInit(&lex, str);
+  JsLex *oldLex = jslSetLex(&lex);
+  jslInit(str);
   jsvUnLock(str);
-  JsVar *res = jswrap_json_parse_internal(&lex);
-  jslKill(&lex);
+  JsVar *res = jswrap_json_parse_internal();
+  jslKill();
+  jslSetLex(oldLex);
   return res;
 }
 
@@ -168,7 +170,9 @@ void jsfGetJSONForFunctionWithCallback(JsVar *var, JSONFlags flags, vcbprintf_ca
         firstParm=false;
       else
         cbprintf(user_callback, user_data, ",");
-      cbprintf(user_callback, user_data, "%v", child);
+      JsVar *name = jsvNewFromStringVar(child, 1, JSVAPPENDSTRINGVAR_MAXLENGTH);
+      cbprintf(user_callback, user_data, "%v", name);
+      jsvUnLock(name);
     } else if (jsvIsString(child) && jsvIsStringEqual(child, JSPARSE_FUNCTION_CODE_NAME)) {
       codeVar = jsvObjectIteratorGetValue(&it);
     }
@@ -185,7 +189,9 @@ void jsfGetJSONForFunctionWithCallback(JsVar *var, JSONFlags flags, vcbprintf_ca
       if (flags & JSON_LIMIT) {
         cbprintf(user_callback, user_data, "{%s}", JSON_LIMIT_TEXT);
       } else {
-        cbprintf(user_callback, user_data, "%v", codeVar);
+        const char *prefix = jsvIsFunctionReturn(var) ? "return " : "";
+        bool hadNewLine = jsvGetStringIndexOf(codeVar,'\n')>0;
+        cbprintf(user_callback, user_data, hadNewLine?"{\n  %s%v\n}":"{%s%v}", prefix, codeVar);
       }
     } else cbprintf(user_callback, user_data, "{}");
   }
@@ -370,8 +376,8 @@ void jsfGetJSON(JsVar *var, JsVar *result, JSONFlags flags) {
 }
 
 void jsfPrintJSON(JsVar *var, JSONFlags flags) {
-  jsfGetJSONWithCallback(var, flags, (vcbprintf_callback)jsiConsolePrint, 0);
+  jsfGetJSONWithCallback(var, flags, (vcbprintf_callback)jsiConsolePrintString, 0);
 }
 void jsfPrintJSONForFunction(JsVar *var, JSONFlags flags) {
-  jsfGetJSONForFunctionWithCallback(var, flags, (vcbprintf_callback)jsiConsolePrint, 0);
+  jsfGetJSONForFunctionWithCallback(var, flags, (vcbprintf_callback)jsiConsolePrintString, 0);
 }

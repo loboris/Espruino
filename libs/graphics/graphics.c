@@ -201,6 +201,60 @@ void graphicsDrawRect(JsGraphics *gfx, short x1, short y1, short x2, short y2) {
   graphicsFillRectDevice(gfx,x1,y2,x1,y1);
 }
 
+void graphicsDrawCircle(JsGraphics *gfx, short posX, short posY, short rad) {
+  graphicsToDeviceCoordinates(gfx, &posX, &posY);
+
+  int radY = 0,
+      radX = rad;
+  // Decision criterion divided by 2 evaluated at radX=radX, radY=0
+  int decisionOver2 = 1 - radX;
+
+  while (radX >= radY) {
+    graphicsSetPixelDevice(gfx, radX + posX,  radY + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, radY + posX,  radX + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, -radX + posX,  radY + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, -radY + posX,  radX + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, -radX + posX, -radY + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, -radY + posX, -radX + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, radX + posX, -radY + posY, gfx->data.fgColor);
+    graphicsSetPixelDevice(gfx, radY + posX, -radX + posY, gfx->data.fgColor);
+    radY++;
+
+    if (decisionOver2 <= 0) {
+      // Change in decision criterion for radY -> radY+1
+      decisionOver2 += 2 * radY + 1;
+    }
+    else {
+      radX--;
+      // Change for radY -> radY+1, radX -> radX-1
+      decisionOver2 += 2 * (radY - radX) + 1;
+    }
+  }
+}
+
+void graphicsFillCircle(JsGraphics *gfx, short x, short y, short rad) {
+  graphicsToDeviceCoordinates(gfx, &x, &y);
+
+  int radY = 0;
+  int decisionOver2 = 1 - rad;
+
+  while (rad >= radY) {
+    graphicsFillRectDevice(gfx, rad + x, radY + y, -rad + x, -radY + y);
+    graphicsFillRectDevice(gfx, radY + x, rad + y, -radY + x, -rad + y);
+    graphicsFillRectDevice(gfx, -rad + x, radY + y, rad + x, -radY + y);
+    graphicsFillRectDevice(gfx, -radY + x, rad + y, radY + x, -rad + y);
+    radY++;
+    if (decisionOver2 <= 0){
+      // Change in decision criterion for radY -> radY+1
+      decisionOver2 += 2 * radY + 1;
+    }else{
+      rad--;
+      // Change for radY -> radY+1, rad -> rad-1
+      decisionOver2 += 2 * (radY - rad) + 1;
+    }
+  }
+}
+
 void graphicsDrawString(JsGraphics *gfx, short x1, short y1, const char *str) {
   // no need to modify coordinates as setPixel does that
   while (*str) {
@@ -326,15 +380,17 @@ unsigned int graphicsFillVectorChar(JsGraphics *gfx, short x1, short y1, short s
    * a 200 byte array) */
   int fontOffset = ch-vectorFontOffset;
   for (i=0;i<fontOffset;i++)
-    vertOffset += vectorFonts[i].vertCount;
-  VectorFontChar vector = vectorFonts[fontOffset];
+    vertOffset += READ_FLASH_UINT8(&vectorFonts[i].vertCount);
+  VectorFontChar vector;
+  vector.vertCount = READ_FLASH_UINT8(&vectorFonts[fontOffset].vertCount);
+  vector.width = READ_FLASH_UINT8(&vectorFonts[fontOffset].width);
   short verts[VECTOR_FONT_MAX_POLY_SIZE*2];
   int idx=0;
   for (i=0;i<vector.vertCount;i+=2) {
-    verts[idx+0] = (short)(x1+(((vectorFontPolys[vertOffset+i+0]&0x7F)*size+(VECTOR_FONT_POLY_SIZE/2))/VECTOR_FONT_POLY_SIZE));
-    verts[idx+1] = (short)(y1+(((vectorFontPolys[vertOffset+i+1]&0x7F)*size+(VECTOR_FONT_POLY_SIZE/2))/VECTOR_FONT_POLY_SIZE));
+    verts[idx+0] = (short)(x1 + (((READ_FLASH_UINT8(&vectorFontPolys[vertOffset+i+0])&0x7F)*size + (VECTOR_FONT_POLY_SIZE/2)) / VECTOR_FONT_POLY_SIZE));
+    verts[idx+1] = (short)(y1 + (((READ_FLASH_UINT8(&vectorFontPolys[vertOffset+i+1])&0x7F)*size + (VECTOR_FONT_POLY_SIZE/2)) / VECTOR_FONT_POLY_SIZE));
     idx+=2;
-    if (vectorFontPolys[vertOffset+i+1] & VECTOR_FONT_POLY_SEPARATOR) {
+    if (READ_FLASH_UINT8(&vectorFontPolys[vertOffset+i+1]) & VECTOR_FONT_POLY_SEPARATOR) {
       graphicsFillPoly(gfx,idx/2, verts);
 
       if (jspIsInterrupted()) break;
@@ -349,13 +405,14 @@ unsigned int graphicsVectorCharWidth(JsGraphics *gfx, short size, char ch) {
   NOT_USED(gfx);
   if (size<0) return 0;
   if (ch<vectorFontOffset || ch-vectorFontOffset>=vectorFontCount) return 0;
-  VectorFontChar vector = vectorFonts[ch-vectorFontOffset];
-  return (vector.width * (unsigned int)size)/(VECTOR_FONT_POLY_SIZE*2);
+  unsigned char width = READ_FLASH_UINT8(&vectorFonts[ch-vectorFontOffset].width);
+  return (width * (unsigned int)size)/(VECTOR_FONT_POLY_SIZE*2);
 }
 #endif
 
 // Splash screen
 void graphicsSplash(JsGraphics *gfx) {
+  graphicsClear(gfx);
   graphicsDrawString(gfx,0,0,"Espruino "JS_VERSION);
   graphicsDrawString(gfx,0,6,"  Embedded JavaScript");
   graphicsDrawString(gfx,0,12,"  www.espruino.com");

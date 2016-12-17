@@ -20,35 +20,15 @@
 
 #include <stdint.h>
 
-/// Functions for reading and writing flash.
-bool nrf_utils_get_page(uint32_t addr, uint32_t * page_address, uint32_t * page_size);
-void nrf_utils_erase_flash_page(uint32_t addr);
-void nrf_utils_read_flash_bytes(uint8_t * buf, uint32_t addr, uint32_t len);
-void nrf_utils_write_flash_bytes(uint32_t addr, uint8_t * buf, uint32_t len);
-
-/// Functions for configuring and setting GPIOS.
-void nrf_utils_gpio_pin_set(uint32_t pin);
-void nrf_utils_gpio_pin_clear(uint32_t pin);
-uint32_t nrf_utils_gpio_pin_read(uint32_t pin);
-void nrf_utils_gpio_pin_set_state(uint32_t pin, uint32_t state);
-uint32_t nrf_utils_gpio_pin_get_state(uint32_t pin);
-
-void nrf_utils_delay_us(uint32_t microsec);
+unsigned int nrf_utils_get_baud_enum(int baud);
 
 // Configure the low frequency clock to use the external 32.768 kHz crystal as a source & start.
 void nrf_utils_lfclk_config_and_start(void);
 
-// Configure the RTC to default settings (ticks every 1/32768 seconds) and then start it.
-void nrf_utils_rtc1_config_and_start(void);
-
 int nrf_utils_get_device_id(uint8_t * device_id, int maxChars);
 uint8_t nrf_utils_get_random_number(void);
-uint32_t nrf_utils_get_system_time(void);
-uint32_t nrf_utils_read_temperature(void);
 
-void nrf_utils_app_uart_put(uint8_t character);
-
-void print_string_to_terminal(uint8_t * debug_string, uint32_t len);
+unsigned int nrf_utils_cap_sense(int capSenseTxPin, int capSenseRxPin);
 
 #endif // NRF5X_UTILS_H__
 

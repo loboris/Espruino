@@ -16,13 +16,12 @@
 #include "jsinteractive.h"
 
 #ifdef LINUX
+#include <stdio.h>
 #include <signal.h>
 #endif//LINUX
 #ifdef USE_TRIGGER
 #include "trigger.h"
 #endif
-
-
 
 // ----------------------------------------------------------------------------
 //                                                              WATCH CALLBACKS
@@ -56,7 +55,8 @@ typedef enum {
   SDS_XOFF_SENT = 4, // sending XON clears this
   SDS_FLOW_CONTROL_XON_XOFF = 8, // flow control enabled
 } PACKED_FLAGS JshSerialDeviceState;
-JshSerialDeviceState jshSerialDeviceStates[USART_COUNT+1];
+JshSerialDeviceState jshSerialDeviceStates[EV_SERIAL1+USART_COUNT-EV_SERIAL_START];
+#define TO_SERIAL_DEVICE_STATE(X) ((X)-EV_SERIAL_START)
 
 // ----------------------------------------------------------------------------
 //                                                              IO EVENT BUFFER
@@ -66,18 +66,26 @@ volatile unsigned char ioHead=0, ioTail=0;
 // ----------------------------------------------------------------------------
 
 
-/**
- * Initialize all the devices.
- */
-void jshInitDevices() { // called from jshInit
-  int i;
+/** Initialize any device-specific structures, like flow control states.
+ * Called from jshInit */
+void jshInitDevices() {
+  jshResetDevices();
+}
+
+/** Reset any devices that could have been set up differently by JS code.
+ * Called from jshReset */
+void jshResetDevices() {
+  unsigned int i;
+  // Reset list of pins that were set manually
+  jshResetPinStateIsManual();
   // setup flow control
-  jshSerialDeviceStates[0] = SDS_FLOW_CONTROL_XON_XOFF; // USB
-  for (i=1;i<=USART_COUNT;i++)
+  for (i=0;i<sizeof(jshSerialDeviceStates) / sizeof(JshSerialDeviceState);i++)
     jshSerialDeviceStates[i] = SDS_NONE;
+  jshSerialDeviceStates[TO_SERIAL_DEVICE_STATE(EV_USBSERIAL)] = SDS_FLOW_CONTROL_XON_XOFF;
   // set up callbacks for events
   for (i=EV_EXTI0;i<=EV_EXTI_MAX;i++)
     jshEventCallbacks[i-EV_EXTI0] = 0;
+
 }
 
 // ----------------------------------------------------------------------------
@@ -93,6 +101,14 @@ void jshTransmit(
     jshPushIOCharEvent(device==EV_LOOPBACKB ? EV_LOOPBACKA : EV_LOOPBACKB, (char)data);
     return;
   }
+#ifdef USE_TELNET
+  if (device == EV_TELNET) {
+    // gross hack to avoid deadlocking on the network here
+    extern void telnetSendChar(char c);
+    telnetSendChar(data);
+    return;
+  }
+#endif
 #ifndef LINUX
 #ifdef USB
   if (device==EV_USBSERIAL && !jshIsUSBSERIALConnected()) {
@@ -116,12 +132,22 @@ void jshTransmit(
   unsigned char txHeadNext = (unsigned char)((txHead+1)&TXBUFFERMASK);
   if (txHeadNext==txTail) {
     jsiSetBusy(BUSY_TRANSMIT, true);
+    bool wasConsoleLimbo = device==EV_LIMBO && jsiGetConsoleDevice()==EV_LIMBO;
     while (txHeadNext==txTail) {
       // wait for send to finish as buffer is about to overflow
 #ifdef USB
       // just in case USB was unplugged while we were waiting!
       if (!jshIsUSBSERIALConnected()) jshTransmitClearDevice(EV_USBSERIAL);
 #endif
+    }
+    if (wasConsoleLimbo && jsiGetConsoleDevice()!=EV_LIMBO) {
+      /* It was 'Limbo', but now it's not - see jsiOneSecondAfterStartup.
+      Basically we must have printed a bunch of stuff to LIMBO and blocked
+      with our output buffer full. But then jsiOneSecondAfterStartup
+      switches to the right console device and swaps everything we wrote
+      over to that device too. Only we're now here, still writing to the
+      old device when really we should be writing to the new one. */
+      device = jsiGetConsoleDevice();
     }
     jsiSetBusy(BUSY_TRANSMIT, false);
   }
@@ -147,7 +173,7 @@ int jshGetCharToTransmit(
     IOEventFlags device // The device being looked at for a transmission.
   ) {
   if (DEVICE_IS_USART(device)) {
-    JshSerialDeviceState *deviceState = &jshSerialDeviceStates[device-EV_USBSERIAL];
+    JshSerialDeviceState *deviceState = &jshSerialDeviceStates[TO_SERIAL_DEVICE_STATE(device)];
     if ((*deviceState)&SDS_XOFF_PENDING) {
       (*deviceState) = ((*deviceState)&(~SDS_XOFF_PENDING)) | SDS_XOFF_SENT;
       return 19/*XOFF*/;
@@ -220,7 +246,7 @@ bool jshHasTransmitData() {
 /**
  * flag that the buffer has overflowed.
  */
-void jshIOEventOverflowed() {
+void CALLED_FROM_INTERRUPT jshIOEventOverflowed() {
   // Error here - just set flag so we don't dump a load of data out
   jsErrorFlags |= JSERR_RX_FIFO_FULL;
 }
@@ -235,8 +261,7 @@ void jshPushIOCharEvent(
   ) {
   // Check for a CTRL+C
   if (charData==3 && channel==jsiGetConsoleDevice()) {
-    // Ctrl-C - force interrupt
-    execInfo.execute |= EXEC_CTRL_C;
+    jsiCtrlC(); // Ctrl-C - force interrupt of execution
     return;
   }
   // Check for existing buffer (we must have at least 2 in the queue to avoid dropping chars though!)
@@ -258,23 +283,43 @@ void jshPushIOCharEvent(
   // Set flow control (as we're going to use more data)
   if (DEVICE_IS_USART(channel) && jshGetEventsUsed() > IOBUFFER_XOFF)
     jshSetFlowControlXON(channel, false);
-  // Make new buffer
+
+  /* Make new buffer
+   *
+   * We're disabling IRQs for this bit because it's actually quite likely for
+   * USB and USART data to be coming in at the same time, and it can trip
+   * things up if one IRQ interrupts another. */
+  jshInterruptOff();
   unsigned char nextHead = (unsigned char)((ioHead+1) & IOBUFFERMASK);
   if (ioTail == nextHead) {
+    jshInterruptOn();
     jshIOEventOverflowed();
     return; // queue full - dump this event!
   }
-  ioBuffer[ioHead].flags = channel;
-  IOEVENTFLAGS_SETCHARS(ioBuffer[ioHead].flags, 1);
-  ioBuffer[ioHead].data.chars[0] = charData;
+  unsigned char oldHead = ioHead;
   ioHead = nextHead;
+  ioBuffer[oldHead].flags = channel;
+  // once channel is set we're safe - another IRQ won't touch this
+  jshInterruptOn();
+  IOEVENTFLAGS_SETCHARS(ioBuffer[oldHead].flags, 1);
+  ioBuffer[oldHead].data.chars[0] = charData;
 }
 
-void jshPushIOWatchEvent(IOEventFlags channel) {
+/**
+ * Signal an IO watch event as having happened.
+ */
+// on the esp8266 we need this to be loaded into static RAM because it can run at interrupt time
+void CALLED_FROM_INTERRUPT jshPushIOWatchEvent(
+    IOEventFlags channel //!< The channel on which the IO watch event has happened.
+  ) {
+  assert(channel >= EV_EXTI0 && channel <= EV_EXTI_MAX);
+
   bool state = jshGetWatchedPinState(channel);
 
+  // If there is a callback associated with this GPIO event then invoke
+  // it and we are done.
   if (jshEventCallbacks[channel-EV_EXTI0]) {
-    jshEventCallbacks[channel-EV_EXTI0](state);
+    jshEventCallbacks[channel-EV_EXTI0](state, channel);
     return;
   }
 
@@ -289,7 +334,13 @@ void jshPushIOWatchEvent(IOEventFlags channel) {
   jshPushIOEvent(channel | (state?EV_EXTI_IS_HIGH:0), time);
 }
 
-void jshPushIOEvent(IOEventFlags channel, JsSysTime time) {
+/**
+ * Add this IO event to the IO event queue.
+ */
+void CALLED_FROM_INTERRUPT jshPushIOEvent(
+    IOEventFlags channel, //!< The event to add to the queue.
+    JsSysTime time        //!< The time that the event is thought to have happened.
+  ) {
   unsigned char nextHead = (unsigned char)((ioHead+1) & IOBUFFERMASK);
   if (ioTail == nextHead) {
     jshIOEventOverflowed();
@@ -382,6 +433,12 @@ const char *jshGetDeviceString(
 #ifdef USB
   case EV_USBSERIAL: return "USB";
 #endif
+#ifdef BLUETOOTH
+  case EV_BLUETOOTH: return "Bluetooth";
+#endif
+#ifdef USE_TELNET
+  case EV_TELNET: return "Telnet";
+#endif
   case EV_SERIAL1: return "Serial1";
   case EV_SERIAL2: return "Serial2";
   case EV_SERIAL3: return "Serial3";
@@ -432,6 +489,16 @@ IOEventFlags jshFromDeviceString(
     return EV_USBSERIAL;
   }
 #endif
+#ifdef BLUETOOTH
+  if (device[0]=='B') {
+     if (strcmp(&device[1], "luetooth")==0) return EV_BLUETOOTH;
+  }
+#endif
+#ifdef USE_TELNET
+  if (device[0]=='T') {
+     if (strcmp(&device[1], "elnet")==0) return EV_TELNET;
+  }
+#endif
   else if (device[0]=='S') {
     if (device[1]=='e' && device[2]=='r' && device[3]=='i' && device[4]=='a' && device[5]=='l' && device[6]!=0 && device[7]==0) {
       if (device[6]=='1') return EV_SERIAL1;
@@ -476,7 +543,7 @@ IOEventFlags jshFromDeviceString(
 /// Set whether the host should transmit or not
 void jshSetFlowControlXON(IOEventFlags device, bool hostShouldTransmit) {
   if (DEVICE_IS_USART(device)) {
-    JshSerialDeviceState *deviceState = &jshSerialDeviceStates[device-EV_USBSERIAL];
+    JshSerialDeviceState *deviceState = &jshSerialDeviceStates[TO_SERIAL_DEVICE_STATE(device)];
     if ((*deviceState) & SDS_FLOW_CONTROL_XON_XOFF) {
       if (hostShouldTransmit) {
         if (((*deviceState)&(SDS_XOFF_SENT|SDS_XON_PENDING)) == SDS_XOFF_SENT) {
@@ -507,7 +574,7 @@ JsVar *jshGetDeviceObject(IOEventFlags device) {
 /// Set whether to use flow control on the given device or not
 void jshSetFlowControlEnabled(IOEventFlags device, bool xOnXOff) {
   if (!DEVICE_IS_USART(device)) return;
-  JshSerialDeviceState *deviceState = &jshSerialDeviceStates[device-EV_USBSERIAL];
+  JshSerialDeviceState *deviceState = &jshSerialDeviceStates[TO_SERIAL_DEVICE_STATE(device)];
   if (xOnXOff)
     (*deviceState) |= SDS_FLOW_CONTROL_XON_XOFF;
   else
@@ -515,7 +582,11 @@ void jshSetFlowControlEnabled(IOEventFlags device, bool xOnXOff) {
 }
 
 /// Set a callback function to be called when an event occurs
-void jshSetEventCallback(IOEventFlags channel, JshEventCallbackCallback callback) {
+void jshSetEventCallback(
+    IOEventFlags channel,             //!< The event that fires the callback.
+    JshEventCallbackCallback callback //!< The callback to be invoked.
+  ) {
+  // Save the callback function for this event channel.
   assert(channel>=EV_EXTI0 && channel<=EV_EXTI_MAX);
   jshEventCallbacks[channel-EV_EXTI0] = callback;
 }

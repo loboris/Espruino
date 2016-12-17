@@ -30,14 +30,6 @@
 #include "jswrap_object.h"
 #include "jswrap_stream.h"
 
-/*JSON{
-  "type" : "library",
-  "ifndef" : "SAVE_ON_FLASH",
-  "class" : "Pipe"
-}
-This is the Pipe container for async related IO.
- */
-
 static JsVar* pipeGetArray(bool create) {
   return jsvObjectGetChild(execInfo.hiddenRoot, "pipes", create ? JSV_ARRAY : 0);
 }
@@ -280,11 +272,11 @@ void jswrap_pipe(JsVar* source, JsVar* dest, JsVar* options) {
             if (jsvIsNumeric(c) && jsvGetInteger(c)>0)
               chunkSize = jsvGetInteger(c);
             else
-              jsWarn("chunkSize must be an integer > 0");
+              jsExceptionHere(JSET_TYPEERROR, "chunkSize must be an integer > 0");
             jsvUnLock(c);
           }
         } else if (!jsvIsUndefined(options)) {
-          jsWarn("'options' must be an object, or undefined");
+          jsExceptionHere(JSET_TYPEERROR, "'options' must be an object, or undefined");
         }
         // set up our event listeners
         jswrap_object_addEventListener(source, "close", jswrap_pipe_src_close_listener, JSWAT_VOID | (JSWAT_JSVAR << (JSWAT_BITS*1)));

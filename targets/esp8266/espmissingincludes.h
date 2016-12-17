@@ -1,3 +1,18 @@
+/*
+ * This file is part of Espruino, a JavaScript interpreter for Microcontrollers
+ *
+ * Copyright (C) 2015 Gordon Williams <gw@pur3.co.uk>
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ * ----------------------------------------------------------------------------
+ * This file is designed to be parsed during the build process
+ *
+ * Contains ESP8266 board specific functions.
+ * ----------------------------------------------------------------------------
+ */
 #ifndef ESPMISSINGINCLUDES_H
 #define ESPMISSINGINCLUDES_H
 
@@ -6,7 +21,7 @@
 
 // The linking is arranged to put all functions into IROM, so we need a special define to put
 // a function into IRAM
-#define ICACHE_RAM_ATTR __attribute__((section(".iram1.text")))
+#define CALLED_FROM_INTERRUPT __attribute__((section(".iram1.text")))
 
 //Missing function prototypes in include folders. Gcc will warn on these if we don't define 'em anywhere.
 //MOST OF THESE ARE GUESSED! but they seem to work and shut up the compiler.
@@ -27,6 +42,7 @@ void NmiTimSetFunc(void (*func)(void));
 
 int ets_memcmp(const void *s1, const void *s2, size_t n);
 void *ets_memcpy(void *dest, const void *src, size_t n);
+void *ets_memmove(void *dest, const void *src, size_t n);
 void *ets_memset(void *s, int c, size_t n);
 int ets_sprintf(char *str, const char *format, ...)  __attribute__ ((format (printf, 2, 3)));
 int ets_str2macaddr(void *, void *);

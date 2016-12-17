@@ -41,7 +41,7 @@ bool jsvIterateCallback(
         ok = jsvIterateCallback(dataVar, callback, callbackData);
       }
     } else {
-      jsWarn("If specifying an object, it must be of the form {data : ..., count : N}");
+      jsExceptionHere(JSET_TYPEERROR, "If specifying an object, it must be of the form {data : ..., count : N} - got %j", data);
     }
     jsvUnLock2(countVar, dataVar);
   }
@@ -86,7 +86,7 @@ bool jsvIterateCallback(
     }
     jsvIteratorFree(&it);
   } else {
-    jsWarn("Expecting a number or something iterable, got %t", data);
+    jsExceptionHere(JSET_TYPEERROR, "Expecting a number or something iterable, got %t", data);
     ok = false;
   }
   return ok;
@@ -143,16 +143,15 @@ unsigned int jsvIterateCallbackToBytes(JsVar *var, unsigned char *data, unsigned
 void jsvStringIteratorNew(JsvStringIterator *it, JsVar *str, size_t startIdx) {
   assert(jsvHasCharacterData(str));
   it->var = jsvLockAgain(str);
+  it->varIndex = 0;
   it->charsInVar = jsvGetCharactersInVar(str);
+  it->charIdx = startIdx;
   if (jsvIsFlatString(str)) {
-    /* Flat strings use the first var to store the size, and subsequent vars
-       to store the actual data, so we tweak charIdx to handle this */
-    it->varIndex = -sizeof(JsVar);
-    it->charsInVar += sizeof(JsVar);
-    it->charIdx = sizeof(JsVar)+startIdx;
-  } else {
-    it->varIndex = 0;
-    it->charIdx = startIdx;
+    it->ptr = jsvGetFlatStringPointer(it->var);
+  } else if (jsvIsNativeString(str)) {
+    it->ptr = (char*)it->var->varData.nativeStr.ptr;
+  } else{
+    it->ptr = &it->var->varData.str[0];
   }
   while (it->charIdx>0 && it->charIdx >= it->charsInVar) {
     it->charIdx -= it->charsInVar;
@@ -162,16 +161,29 @@ void jsvStringIteratorNew(JsvStringIterator *it, JsVar *str, size_t startIdx) {
         JsVar *next = jsvLock(jsvGetLastChild(it->var));
         jsvUnLock(it->var);
         it->var = next;
+        it->ptr = &next->varData.str[0];
         it->charsInVar = jsvGetCharactersInVar(it->var);
       } else {
         jsvUnLock(it->var);
         it->var = 0;
+        it->ptr = 0;
         it->charsInVar = 0;
         it->varIndex = startIdx - it->charIdx;
         return; // at end of string - get out of loop
       }
     }
   }
+}
+
+JsvStringIterator jsvStringIteratorClone(JsvStringIterator *it) {
+  JsvStringIterator i = *it;
+  if (i.var) jsvLockAgain(i.var);
+  return i;
+}
+
+void jsvStringIteratorSetChar(JsvStringIterator *it, char c) {
+  if (jsvStringIteratorHasChar(it))
+    it->ptr[it->charIdx] = c;
 }
 
 void jsvStringIteratorNext(JsvStringIterator *it) {
@@ -187,6 +199,7 @@ void jsvStringIteratorGotoEnd(JsvStringIterator *it) {
     it->varIndex += it->charsInVar;
     it->charsInVar = jsvGetCharactersInVar(it->var);
   }
+  it->ptr = &it->var->varData.str[0];
   if (it->charsInVar) it->charIdx = it->charsInVar-1;
   else it->charIdx = 0;
 }
@@ -208,6 +221,7 @@ void jsvStringIteratorAppend(JsvStringIterator *it, char ch) {
     if (!next) {
       jsvUnLock(it->var);
       it->var = 0;
+      it->ptr = 0;
       it->charIdx = 0;
       return; // out of memory
     }
@@ -215,14 +229,61 @@ void jsvStringIteratorAppend(JsvStringIterator *it, char ch) {
     jsvSetLastChild(it->var, jsvGetRef(next));
     jsvUnLock(it->var);
     it->var = next;
+    it->ptr = &next->varData.str[0];
     it->varIndex += it->charIdx;
     it->charIdx = 0; // it's new, so empty
   }
-  it->var->varData.str[it->charIdx] = ch;
+  it->ptr[it->charIdx] = ch;
   it->charsInVar = it->charIdx+1;
   jsvSetCharactersInVar(it->var, it->charsInVar);
 }
 
+void jsvStringIteratorAppendString(JsvStringIterator *it, JsVar *str) {
+  JsvStringIterator sit;
+  jsvStringIteratorNew(&sit, str, 0);
+  while (jsvStringIteratorHasChar(&sit)) {
+    jsvStringIteratorAppend(it, jsvStringIteratorGetChar(&sit));
+    jsvStringIteratorNext(&sit);
+  }
+  jsvStringIteratorFree(&sit);
+}
+
+// --------------------------------------------------------------------------------------------
+
+void jsvObjectIteratorNew(JsvObjectIterator *it, JsVar *obj) {
+  assert(jsvIsArray(obj) || jsvIsObject(obj) || jsvIsFunction(obj));
+  it->var = jsvGetFirstChild(obj) ? jsvLock(jsvGetFirstChild(obj)) : 0;
+}
+
+/// Clone the iterator
+JsvObjectIterator jsvObjectIteratorClone(JsvObjectIterator *it) {
+  JsvObjectIterator i = *it;
+  if (i.var) jsvLockAgain(i.var);
+  return i;
+}
+
+/// Move to next item
+void jsvObjectIteratorNext(JsvObjectIterator *it) {
+  if (it->var) {
+    JsVarRef next = jsvGetNextSibling(it->var);
+    jsvUnLock(it->var);
+    it->var = next ? jsvLock(next) : 0;
+  }
+}
+
+void jsvObjectIteratorSetValue(JsvObjectIterator *it, JsVar *value) {
+  if (!it->var) return; // end of object
+  jsvSetValueOfName(it->var, value);
+}
+
+void jsvObjectIteratorRemoveAndGotoNext(JsvObjectIterator *it, JsVar *parent) {
+  if (it->var) {
+    JsVarRef next = jsvGetNextSibling(it->var);
+    jsvRemoveChild(parent, it->var);
+    jsvUnLock(it->var);
+    it->var = next ? jsvLock(next) : 0;
+  }
+}
 
 // --------------------------------------------------------------------------------------------
 void   jsvArrayBufferIteratorNew(JsvArrayBufferIterator *it, JsVar *arrayBuffer, size_t index) {
@@ -243,6 +304,13 @@ void   jsvArrayBufferIteratorNew(JsvArrayBufferIterator *it, JsVar *arrayBuffer,
   jsvStringIteratorNew(&it->it, arrayBufferData, (size_t)it->byteOffset);
   jsvUnLock(arrayBufferData);
   it->hasAccessedElement = false;
+}
+
+/// Clone the iterator
+ALWAYS_INLINE JsvArrayBufferIterator jsvArrayBufferIteratorClone(JsvArrayBufferIterator *it) {
+  JsvArrayBufferIterator i = *it;
+  i.it = jsvStringIteratorClone(&it->it);
+  return i;
 }
 
 static void jsvArrayBufferIteratorGetValueData(JsvArrayBufferIterator *it, char *data) {

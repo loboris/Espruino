@@ -54,7 +54,7 @@ JsVar *jswrap_array_constructor(JsVar *args) {
         jsExceptionHere(JSET_ERROR, "Invalid array length");
         return 0;
       } else {
-        JsVar *arr = jsvNewWithFlags(JSV_ARRAY);
+        JsVar *arr = jsvNewEmptyArray();
         if (!arr) return 0; // out of memory
         jsvSetArrayLength(arr, count, false);
         return arr;
@@ -146,6 +146,8 @@ JsVar *jswrap_array_join(JsVar *parent, JsVar *filler) {
   "return" : ["int","The new size of the array"]
 }
 Push a new value onto the end of this array'
+
+This is the opposite of `[1,2,3].unshift(0)`, which adds one or more elements to the beginning of the array.
  */
 JsVarInt jswrap_array_push(JsVar *parent, JsVar *args) {
   if (!jsvIsArray(parent)) return -1;
@@ -172,7 +174,9 @@ JsVarInt jswrap_array_push(JsVar *parent, JsVar *args) {
   "generate_full" : "jsvArrayPop(parent)",
   "return" : ["JsVar","The value that is popped off"]
 }
-Pop a new value off of the end of this array
+Remove and return the value on the end of this array.
+
+This is the opposite of `[1,2,3].shift()`, which removes an element from the beginning of the array.
  */
 
 JsVar *_jswrap_array_iterate_with_callback(const char *name, JsVar *parent, JsVar *funcVar, JsVar *thisVar, bool wantArray, bool isBoolCallback, bool expectedValue) {
@@ -190,7 +194,7 @@ JsVar *_jswrap_array_iterate_with_callback(const char *name, JsVar *parent, JsVa
   }
   JsVar *result = 0;
   if (wantArray)
-    result = jsvNewWithFlags(JSV_ARRAY);
+    result = jsvNewEmptyArray();
   bool isDone = false;
   if (result || !wantArray) {
     JsvIterator it;
@@ -419,7 +423,7 @@ JsVar *jswrap_array_splice(JsVar *parent, JsVarInt index, JsVar *howManyVar, JsV
   JsVarInt shift = newItems-howMany;
 
   bool needToAdd = false;
-  JsVar *result = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *result = jsvNewEmptyArray();
 
   JsvObjectIterator it;
   jsvObjectIteratorNew(&it, parent);
@@ -490,12 +494,14 @@ JsVar *jswrap_array_splice(JsVar *parent, JsVarInt index, JsVar *howManyVar, JsV
   ],
   "return" : ["JsVar","The element that was removed"]
 }
-Remove the first element of the array, and return it
+Remove and return the first element of the array.
+
+This is the opposite of `[1,2,3].pop()`, which takes an element off the end.
  */
 JsVar *jswrap_array_shift(JsVar *parent) {
   // just use splice, as this does all the hard work for us
   JsVar *nRemove = jsvNewFromInteger(1);
-  JsVar *elements = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *elements = jsvNewEmptyArray();
   JsVar *arr = jswrap_array_splice(parent, 0, nRemove, elements);
   jsvUnLock2(elements, nRemove);
   // unpack element from the array
@@ -517,7 +523,9 @@ JsVar *jswrap_array_shift(JsVar *parent) {
   ],
   "return" : ["int","The new array length"]
 }
-Remove the first element of the array, and return it
+Add one or more items to the start of the array, and return its new length.
+
+This is the opposite of `[1,2,3].push(4)`, which puts one or more elements on the end.
  */
 JsVarInt jswrap_array_unshift(JsVar *parent, JsVar *elements) {
   // just use splice, as this does all the hard work for us
@@ -550,7 +558,7 @@ JsVar *jswrap_array_slice(JsVar *parent, JsVarInt start, JsVar *endVar) {
 
   JsVarInt k = 0;
   JsVarInt final = len;
-  JsVar *array = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *array = jsvNewEmptyArray();
 
   if (!array) return 0;
 
@@ -745,7 +753,7 @@ JsVar *jswrap_array_sort (JsVar *array, JsVar *compareFn) {
 Create a new array, containing the elements from this one and any arguments, if any argument is an array then those elements will be added.
  */
 JsVar *jswrap_array_concat(JsVar *parent, JsVar *args) {
-  JsVar *result = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *result = jsvNewEmptyArray();
 
   JsvObjectIterator argsIt;
   jsvObjectIteratorNew(&argsIt, args);

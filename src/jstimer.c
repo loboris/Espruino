@@ -93,6 +93,9 @@ void jstUtilTimerInterruptHandler() {
           jshPinSetValue(task->data.set.pins[j], (task->data.set.value >> j)&1);
         }
       } break;
+      case UET_EXECUTE:
+        executeFn = task->data.execute;
+        break;
 #ifndef SAVE_ON_FLASH
       case UET_READ_SHORT: {
         if (!task->data.buffer.var) break;
@@ -126,7 +129,8 @@ void jstUtilTimerInterruptHandler() {
         // now search for other tasks writing to this pin... (polyphony)
         int t = (utilTimerTasksTail+1) & (UTILTIMERTASK_TASKS-1);
         while (t!=utilTimerTasksHead) {
-          if (UET_IS_BUFFER_WRITE_EVENT(utilTimerTasks[t].type))
+          if (UET_IS_BUFFER_WRITE_EVENT(utilTimerTasks[t].type) && 
+              utilTimerTasks[t].data.buffer.pinFunction == task->data.buffer.pinFunction)
             sum += ((int)(unsigned int)utilTimerTasks[t].data.buffer.currentValue) - 32768;
           t = (t+1) & (UTILTIMERTASK_TASKS-1);
         }
@@ -137,9 +141,6 @@ void jstUtilTimerInterruptHandler() {
         jshSetOutputValue(task->data.buffer.pinFunction, sum);
         break;
       }
-      case UET_EXECUTE:
-        executeFn = task->data.execute;
-        break;
 #endif
       case UET_WAKEUP: // we've already done our job by waking the device up
       default: break;
@@ -312,6 +313,12 @@ static bool jstPinTaskChecker(UtilTimerTask *task, void *data) {
   return false;
 }
 
+// data = *fn
+static bool jstExecuteTaskChecker(UtilTimerTask *task, void *data) {
+  if (task->type != UET_EXECUTE) return false;
+  return (task->data.execute = data);
+}
+
 // --------------------------------------------------------------------------------------------
 // --------------------------------------------------------------------------------------------
 
@@ -345,17 +352,57 @@ bool jstPinOutputAtTime(JsSysTime time, Pin *pins, int pinCount, uint8_t value) 
 
 // Do software PWM on the given pin, using the timer IRQs
 bool jstPinPWM(JsVarFloat freq, JsVarFloat dutyCycle, Pin pin) {
-  /// Remove any tasks using the given pin
-  while (utilTimerRemoveTask(jstPinTaskChecker, (void*)&pin));
   // if anything is wrong, exit now
   if (dutyCycle<=0 || dutyCycle>=1 || freq<=0) {
     jshPinSetValue(pin, dutyCycle >= 0.5);
+    // remove any timer tasks and exit
+    while (utilTimerRemoveTask(jstPinTaskChecker, (void*)&pin));
     return false;
   }
+  // do calculations...
+  JsSysTime pulseLength = jshGetTimeFromMilliseconds(dutyCycle * 1000.0 / freq);
   JsSysTime period = jshGetTimeFromMilliseconds(1000.0 / freq);
   if (period > 0xFFFFFFFF) {
     jsWarn("Frequency of %f Hz is too slow", freq);
     period = 0xFFFFFFFF;
+  }
+
+  // First, search for existing PWM tasks
+  UtilTimerTask *ptaskon=0, *ptaskoff=0;
+  jshInterruptOff();
+  unsigned char ptr = utilTimerTasksHead;
+  if (ptr != utilTimerTasksTail) {
+    ptr = (ptr+UTILTIMERTASK_TASKS-1) & (UTILTIMERTASK_TASKS-1);
+    // now we're at the last timer task - work back until we've just gone back past utilTimerTasksTail
+    while (ptr != ((utilTimerTasksTail+UTILTIMERTASK_TASKS-1) & (UTILTIMERTASK_TASKS-1))) {
+      if (jstPinTaskChecker(&utilTimerTasks[ptr], (void*)&pin)) {
+        if (utilTimerTasks[ptr].data.set.value)
+          ptaskon = &utilTimerTasks[ptr];
+        else
+          ptaskoff = &utilTimerTasks[ptr];
+      }
+      ptr = (ptr+UTILTIMERTASK_TASKS-1) & (UTILTIMERTASK_TASKS-1);
+    }
+  }
+  if (ptaskon && ptaskoff) {
+    // Great! We have PWM... Just update it
+    if (ptaskoff->time > ptaskon->time)
+      ptaskoff->time = ptaskon->time + pulseLength;
+    else
+      ptaskoff->time = ptaskon->time + pulseLength - (unsigned int)period;
+    ptaskon->repeatInterval = (unsigned int)period;
+    ptaskoff->repeatInterval = (unsigned int)period;
+    /* don't bother rescheduling - everything will work out next time
+     * the timer fires anyway. */
+    // All done - just return!
+    jshInterruptOn();
+    return true;
+  }
+  jshInterruptOn();
+
+  /// Remove any tasks using the given pin (if they existed)
+  if (ptaskon || ptaskoff) {
+    while (utilTimerRemoveTask(jstPinTaskChecker, (void*)&pin));
   }
   JsSysTime time = jshGetSystemTime();
 
@@ -363,7 +410,7 @@ bool jstPinPWM(JsVarFloat freq, JsVarFloat dutyCycle, Pin pin) {
   taskon.data.set.value = 1;
   taskoff.data.set.value = 0;
   taskon.time = time;
-  taskoff.time = time + jshGetTimeFromMilliseconds(dutyCycle * 1000.0 / freq);
+  taskoff.time = time + pulseLength;
   taskon.repeatInterval = (unsigned int)period;
   taskoff.repeatInterval = (unsigned int)period;
   taskon.type = UET_SET;
@@ -380,6 +427,23 @@ bool jstPinPWM(JsVarFloat freq, JsVarFloat dutyCycle, Pin pin) {
   if (!utilTimerInsertTask(&taskon)) return false;
   WAIT_UNTIL(!utilTimerIsFull(), "Utility Timer");
   return utilTimerInsertTask(&taskoff);
+}
+
+/// Execute the given function repeatedly after the given time period
+bool jstExecuteFn(void (*fn)(JsSysTime), JsSysTime startTime, uint32_t period) {
+  UtilTimerTask task;
+  task.time = startTime;
+  task.repeatInterval = period;
+  task.type = UET_EXECUTE;
+  task.data.execute = fn;
+
+  WAIT_UNTIL(!utilTimerIsFull(), "Utility Timer");
+  return utilTimerInsertTask(&task);
+}
+
+/// Stop executing the given function
+bool jstStopExecuteFn(void (*fn)(JsSysTime)) {
+  return utilTimerRemoveTask(jstExecuteTaskChecker, (void*)fn);
 }
 
 /// Set the utility timer so we're woken up in whatever time period
@@ -512,8 +576,8 @@ void jstDumpUtilityTimers() {
     case UET_READ_BYTE : jsiConsolePrintf("READ_BYTE\n"); break;
     case UET_WRITE_SHORT : jsiConsolePrintf("WRITE_SHORT\n"); break;
     case UET_READ_SHORT : jsiConsolePrintf("READ_SHORT\n"); break;
-    case UET_EXECUTE : jsiConsolePrintf("EXECUTE %x\n", task.data.execute); break;
 #endif
+    case UET_EXECUTE : jsiConsolePrintf("EXECUTE %x\n", task.data.execute); break;
     default : jsiConsolePrintf("Unknown type %d\n", task.type); break;
     }
 

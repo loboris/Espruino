@@ -37,6 +37,7 @@ typedef enum {
   JSNETWORKTYPE_W5500,  ///< WIZnet W5500 support
   JSNETWORKTYPE_JS,  ///< JavaScript network type
   JSNETWORKTYPE_ESP8266_BOARD, ///< Espressif ESP8266 board support
+  JSNETWORKTYPE_ESP32 /// < Espressif ESP32 board support
 } JsNetworkType;
 
 typedef struct {
@@ -52,6 +53,8 @@ typedef struct JsNetwork {
   JsVar *networkVar; // this won't be locked again - we just know that it is already locked by something else
   JsNetworkData data;
   unsigned char _blank; ///< this is needed as jsvGetString for 'data' wants to add a trailing zero  
+
+  int chunkSize; ///< Amount of memory to allocate for chunks of data when using send/recv
 
   /// Called on idle. Do any checks required for this device
   void (*idle)(struct JsNetwork *net);
@@ -96,5 +99,27 @@ JsVar *networkGetAddressAsString(unsigned char *ip, int nBytes, unsigned int bas
 void networkPutAddressAsString(JsVar *object, const char *name,  unsigned char *ip, int nBytes, unsigned int base, char separator);
 /** Some devices (CC3000) store the IP address with the first element last, so we must flip it */
 unsigned long networkFlipIPAddress(unsigned long addr);
+
+typedef enum {
+  NCF_NORMAL = 0,
+  NCF_TLS = 1
+} NetCreateFlags;
+
+/// Check for any errors and try and recover (CC3000 only really)
+bool netCheckError(JsNetwork *net);
+
+/// Create a socket (server (host==0) or client)
+int netCreateSocket(JsNetwork *net, uint32_t host, unsigned short port, NetCreateFlags flags, JsVar *options);
+
+/// Ask this socket to close - it may not close immediately
+void netCloseSocket(JsNetwork *net, int sckt);
+
+/** If this is a server socket and we have an incoming connection then
+ * accept and return the socket number - else return <0 */
+int netAccept(JsNetwork *net, int sckt);
+
+void netGetHostByName(JsNetwork *net, char * hostName, uint32_t* out_ip_addr);
+int netRecv(JsNetwork *net, int sckt, void *buf, size_t len);
+int netSend(JsNetwork *net, int sckt, const void *buf, size_t len);
 
 #endif // _NETWORK_H

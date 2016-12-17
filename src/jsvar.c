@@ -21,6 +21,13 @@
 #include "jswrap_object.h" // for jswrap_object_toString
 #include "jswrap_arraybuffer.h" // for jsvNewTypedArray
 
+#ifdef DEBUG
+  /** When freeing, clear the references (nextChild/etc) in the JsVar.
+   * This means we can assert at the end of jsvFreePtr to make sure
+   * everything really is free. */
+  #define CLEAR_MEMORY_ON_FREE
+#endif
+
 /** Basically, JsVars are stored in one big array, so save the need for
  * lots of memory allocation. On Linux, the arrays are in blocks, so that
  * more blocks can be allocated. We can't use realloc on one big block as
@@ -31,14 +38,67 @@
 #ifdef RESIZABLE_JSVARS
 JsVar **jsVarBlocks = 0;
 unsigned int jsVarsSize = 0;
-#define JSVAR_BLOCK_SIZE 1024
-#define JSVAR_BLOCK_SHIFT 10
+#define JSVAR_BLOCK_SIZE 4096
+#define JSVAR_BLOCK_SHIFT 12
 #else
 JsVar jsVars[JSVAR_CACHE_SIZE];
 unsigned int jsVarsSize = JSVAR_CACHE_SIZE;
 #endif
 
-JsVarRef jsVarFirstEmpty; ///< reference of first unused variable (variables are in a linked list)
+volatile JsVarRef jsVarFirstEmpty; ///< reference of first unused variable (variables are in a linked list)
+volatile bool isMemoryBusy; ///< Are we doing garbage collection or similar, so can't access memory?
+
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+
+ALWAYS_INLINE bool jsvIsRoot(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_ROOT; }
+ALWAYS_INLINE bool jsvIsPin(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_PIN; }
+ALWAYS_INLINE bool jsvIsSimpleInt(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_INTEGER; } // is just a very basic integer value
+ALWAYS_INLINE bool jsvIsInt(const JsVar *v) { return v && ((v->flags&JSV_VARTYPEMASK)==JSV_INTEGER || (v->flags&JSV_VARTYPEMASK)==JSV_PIN || (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT || (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_INT || (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_BOOL); }
+ALWAYS_INLINE bool jsvIsFloat(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_FLOAT; }
+ALWAYS_INLINE bool jsvIsBoolean(const JsVar *v) { return v && ((v->flags&JSV_VARTYPEMASK)==JSV_BOOLEAN || (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_BOOL); }
+ALWAYS_INLINE bool jsvIsString(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=_JSV_STRING_START && (v->flags&JSV_VARTYPEMASK)<=_JSV_STRING_END; } ///< String, or a NAME too
+ALWAYS_INLINE bool jsvIsBasicString(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=JSV_STRING_0 && (v->flags&JSV_VARTYPEMASK)<=JSV_STRING_MAX; } ///< Just a string (NOT a name)
+ALWAYS_INLINE bool jsvIsStringExt(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=JSV_STRING_EXT_0 && (v->flags&JSV_VARTYPEMASK)<=JSV_STRING_EXT_MAX; } ///< The extra bits dumped onto the end of a string to store more data
+ALWAYS_INLINE bool jsvIsFlatString(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_FLAT_STRING; }
+ALWAYS_INLINE bool jsvIsNativeString(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_NATIVE_STRING; }
+ALWAYS_INLINE bool jsvIsNumeric(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=_JSV_NUMERIC_START && (v->flags&JSV_VARTYPEMASK)<=_JSV_NUMERIC_END; }
+ALWAYS_INLINE bool jsvIsFunction(const JsVar *v) { return v && ((v->flags&JSV_VARTYPEMASK)==JSV_FUNCTION || (v->flags&JSV_VARTYPEMASK)==JSV_FUNCTION_RETURN); }
+ALWAYS_INLINE bool jsvIsFunctionReturn(const JsVar *v) { return v && ((v->flags&JSV_VARTYPEMASK)==JSV_FUNCTION_RETURN); } ///< Is this a function with an implicit 'return' at the start?
+ALWAYS_INLINE bool jsvIsFunctionParameter(const JsVar *v) { return v && (v->flags&JSV_NATIVE) && jsvIsString(v); }
+ALWAYS_INLINE bool jsvIsObject(const JsVar *v) { return v && (((v->flags&JSV_VARTYPEMASK)==JSV_OBJECT) || ((v->flags&JSV_VARTYPEMASK)==JSV_ROOT)); }
+ALWAYS_INLINE bool jsvIsArray(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_ARRAY; }
+ALWAYS_INLINE bool jsvIsArrayBuffer(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_ARRAYBUFFER; }
+ALWAYS_INLINE bool jsvIsArrayBufferName(const JsVar *v) { return v && (v->flags&(JSV_VARTYPEMASK))==JSV_ARRAYBUFFERNAME; }
+ALWAYS_INLINE bool jsvIsNative(const JsVar *v) { return v && (v->flags&JSV_NATIVE)!=0; }
+ALWAYS_INLINE bool jsvIsNativeFunction(const JsVar *v) { return v && (v->flags&(JSV_NATIVE|JSV_VARTYPEMASK))==(JSV_NATIVE|JSV_FUNCTION); }
+ALWAYS_INLINE bool jsvIsUndefined(const JsVar *v) { return v==0; }
+ALWAYS_INLINE bool jsvIsNull(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_NULL; }
+ALWAYS_INLINE bool jsvIsBasic(const JsVar *v) { return jsvIsNumeric(v) || jsvIsString(v);} ///< Is this *not* an array/object/etc
+ALWAYS_INLINE bool jsvIsName(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=_JSV_NAME_START && (v->flags&JSV_VARTYPEMASK)<=_JSV_NAME_END; } ///< NAMEs are what's used to name a variable (it is not the data itself)
+/// Names with values have firstChild set to a value - AND NOT A REFERENCE
+ALWAYS_INLINE bool jsvIsNameWithValue(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)>=_JSV_NAME_WITH_VALUE_START && (v->flags&JSV_VARTYPEMASK)<=_JSV_NAME_WITH_VALUE_END; }
+ALWAYS_INLINE bool jsvIsNameInt(const JsVar *v) { return v && ((v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_INT || ((v->flags&JSV_VARTYPEMASK)>=JSV_NAME_STRING_INT_0 && (v->flags&JSV_VARTYPEMASK)<=JSV_NAME_STRING_INT_MAX)); }
+ALWAYS_INLINE bool jsvIsNameIntInt(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_INT; }
+ALWAYS_INLINE bool jsvIsNameIntBool(const JsVar *v) { return v && (v->flags&JSV_VARTYPEMASK)==JSV_NAME_INT_BOOL; }
+/// What happens when we access a variable that doesn't exist. We get a NAME where the next + previous siblings point to the object that may one day contain them
+ALWAYS_INLINE bool jsvIsNewChild(const JsVar *v) { return jsvIsName(v) && jsvGetNextSibling(v) && jsvGetNextSibling(v)==jsvGetPrevSibling(v); }
+
+/// Are var.varData.ref.* (excl pad) used for data (so we expect them not to be empty)
+ALWAYS_INLINE bool jsvIsRefUsedForData(const JsVar *v) { return jsvIsStringExt(v) || (jsvIsString(v)&&!jsvIsName(v)) ||  jsvIsFloat(v) || jsvIsNativeFunction(v) || jsvIsArrayBuffer(v) || jsvIsArrayBufferName(v); }
+
+/// Can the given variable be converted into an integer without loss of precision
+ALWAYS_INLINE bool jsvIsIntegerish(const JsVar *v) { return jsvIsInt(v) || jsvIsPin(v) || jsvIsBoolean(v) || jsvIsNull(v); }
+
+ALWAYS_INLINE bool jsvIsIterable(const JsVar *v) {
+  return jsvIsArray(v) || jsvIsObject(v) || jsvIsFunction(v) ||
+         jsvIsString(v) || jsvIsArrayBuffer(v);
+}
+
+
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+
 
 /** Return a pointer - UNSAFE for null refs.
  * This is effectively a Lock without locking! */
@@ -65,16 +125,11 @@ JsVarRefSigned jsvGetFirstChildSigned(const JsVar *v) {
     r -= 1<<(JSVARREF_PACKED_BITS+8);
   return r;
 }
-JsVarRef jsvGetLastChild(const JsVar *v) { return (JsVarRef)(v->varData.ref.lastChild | (((v->varData.ref.pack >> (JSVARREF_PACKED_BITS*1))&JSVARREF_PACKED_BIT_MASK))<<8); }
 JsVarRef jsvGetNextSibling(const JsVar *v) { return (JsVarRef)(v->varData.ref.nextSibling | (((v->varData.ref.pack >> (JSVARREF_PACKED_BITS*2))&JSVARREF_PACKED_BIT_MASK))<<8); }
 JsVarRef jsvGetPrevSibling(const JsVar *v) { return (JsVarRef)(v->varData.ref.prevSibling | (((v->varData.ref.pack >> (JSVARREF_PACKED_BITS*3))&JSVARREF_PACKED_BIT_MASK))<<8); }
 void jsvSetFirstChild(JsVar *v, JsVarRef r) {
   v->varData.ref.firstChild = (unsigned char)(r & 0xFF);
   v->varData.ref.pack = (unsigned char)((v->varData.ref.pack & ~JSVARREF_PACKED_BIT_MASK) | ((r >> 8) & JSVARREF_PACKED_BIT_MASK));
-}
-void jsvSetLastChild(JsVar *v, JsVarRef r) {
-  v->varData.ref.lastChild = (unsigned char)(r & 0xFF);
-  v->varData.ref.pack = (unsigned char)((v->varData.ref.pack & ~(JSVARREF_PACKED_BIT_MASK<<(JSVARREF_PACKED_BITS*1))) | (((r >> 8) & JSVARREF_PACKED_BIT_MASK) << (JSVARREF_PACKED_BITS*1)));
 }
 void jsvSetNextSibling(JsVar *v, JsVarRef r) {
   v->varData.ref.nextSibling = (unsigned char)(r & 0xFF);
@@ -83,6 +138,14 @@ void jsvSetNextSibling(JsVar *v, JsVarRef r) {
 void jsvSetPrevSibling(JsVar *v, JsVarRef r) {
   v->varData.ref.prevSibling = (unsigned char)(r & 0xFF);
   v->varData.ref.pack = (unsigned char)((v->varData.ref.pack & ~(JSVARREF_PACKED_BIT_MASK<<(JSVARREF_PACKED_BITS*3))) | (((r >> 8) & JSVARREF_PACKED_BIT_MASK) << (JSVARREF_PACKED_BITS*3)));
+}
+/* lastchild stores the upper 2 bits in JsVarFlags because then STRING_EXT can use one more character! */
+JsVarRef jsvGetLastChild(const JsVar *v) {
+  return (JsVarRef)(v->varData.ref.lastChild | (((v->flags >> JSV_LASTCHILD_BIT_SHIFT)&JSVARREF_PACKED_BIT_MASK))<<8);
+}
+void jsvSetLastChild(JsVar *v, JsVarRef r) {
+  v->varData.ref.lastChild = (unsigned char)(r & 0xFF);
+  v->flags = (v->flags & ~JSV_LASTCHILD_BIT_MASK) | ((r >> 8) << JSV_LASTCHILD_BIT_SHIFT);
 }
 #endif
 
@@ -99,29 +162,35 @@ void jsvSetMaxVarsUsed(unsigned int size) {
 
 // maps the empty variables in...
 void jsvCreateEmptyVarList() {
+  assert(!isMemoryBusy);
+  isMemoryBusy = true;
   jsVarFirstEmpty = 0;
-  JsVar *lastEmpty = 0;
+  JsVar firstVar; // temporary var to simplify code in the loop below
+  jsvSetNextSibling(&firstVar, 0);
+  JsVar *lastEmpty = &firstVar;
+
   JsVarRef i;
   for (i=1;i<=jsVarsSize;i++) {
     JsVar *var = jsvGetAddressOf(i);
     if ((var->flags&JSV_VARTYPEMASK) == JSV_UNUSED) {
-      jsvSetNextSibling(var, 0);
-      if (lastEmpty)
-        jsvSetNextSibling(lastEmpty, i);
-      else
-        jsVarFirstEmpty = i;
+      jsvSetNextSibling(lastEmpty, i);
       lastEmpty = var;
     } else if (jsvIsFlatString(var)) {
       // skip over used blocks for flat strings
       i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
     }
   }
+  jsvSetNextSibling(lastEmpty, 0);
+  jsVarFirstEmpty = jsvGetNextSibling(&firstVar);
+  isMemoryBusy = false;
 }
 
 /* Removes the empty variable counter, cleaving clear runs of 0s
  where no data resides. This helps if compressing the variables
  for storage. */
 void jsvClearEmptyVarList() {
+  assert(!isMemoryBusy);
+  isMemoryBusy = true;
   jsVarFirstEmpty = 0;
   JsVarRef i;
   for (i=1;i<=jsVarsSize;i++) {
@@ -134,6 +203,7 @@ void jsvClearEmptyVarList() {
       i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
     }
   }
+  isMemoryBusy = false;
 }
 
 void jsvSoftInit() {
@@ -218,7 +288,9 @@ unsigned int jsvGetMemoryTotal() {
 /// Try and allocate more memory - only works if RESIZABLE_JSVARS is defined
 void jsvSetMemoryTotal(unsigned int jsNewVarCount) {
 #ifdef RESIZABLE_JSVARS
+  assert(!isMemoryBusy);
   if (jsNewVarCount <= jsVarsSize) return; // never allow us to have less!
+  isMemoryBusy = true;
   // When resizing, we just allocate a bunch more
   unsigned int oldSize = jsVarsSize;
   unsigned int oldBlockCount = jsVarsSize >> JSVAR_BLOCK_SHIFT;
@@ -235,10 +307,24 @@ void jsvSetMemoryTotal(unsigned int jsNewVarCount) {
   assert(!jsVarFirstEmpty);
   jsVarFirstEmpty = jsvInitJsVars(oldSize+1, jsVarsSize-oldSize);
   // jsiConsolePrintf("Resized memory from %d blocks to %d\n", oldBlockCount, newBlockCount);
+  isMemoryBusy = false;
 #else
   NOT_USED(jsNewVarCount);
   assert(0);
 #endif
+}
+
+bool jsvMoreFreeVariablesThan(unsigned int vars) {
+  if (!vars) return false;
+  JsVarRef r = jsVarFirstEmpty;
+  while (r) {
+    if (!vars) return true;
+    vars--;
+
+    JsVar *v = jsvGetAddressOf(r);
+    r = jsvGetNextSibling(v);
+  }
+  return false;
 }
 
 /// Get whether memory is full or not
@@ -278,38 +364,53 @@ bool jsvHasSingleChild(const JsVar *v) {
 void jsvResetVariable(JsVar *v, JsVarFlags flags) {
   assert((v->flags&JSV_VARTYPEMASK) == JSV_UNUSED);
   // make sure we clear all data...
-  ((unsigned int*)&v->varData.integer)[0] = 0;
-  ((unsigned int*)&v->varData.integer)[1] = 0;
-  // and the rest...
-  jsvSetNextSibling(v, 0);
-  jsvSetPrevSibling(v, 0);
-  jsvSetRefs(v, 0);
-  jsvSetFirstChild(v, 0);
-  jsvSetLastChild(v, 0);
+  /* Force a proper zeroing of all data. We don't use
+   * memset because that'd create a function call. This
+   * should just generate a bunch of STR instructions */
+  unsigned int i;
+  assert((sizeof(JsVar)&3) == 0); // must be a multiple of 4 in size
+  for (i=0;i<sizeof(JsVar)/sizeof(uint32_t);i++)
+    ((uint32_t*)v)[i] = 0;
   // set flags
   assert(!(flags & JSV_LOCK_MASK));
   v->flags = flags | JSV_LOCK_ONE;
 }
 
 JsVar *jsvNewWithFlags(JsVarFlags flags) {
+  if (isMemoryBusy) {
+    jsErrorFlags |= JSERR_MEMORY_BUSY;
+    return 0;
+  }
   if (jsVarFirstEmpty!=0) {
-    assert(jsvGetAddressOf(jsVarFirstEmpty)->flags == JSV_UNUSED);
     jshInterruptOff(); // to allow this to be used from an IRQ
-    JsVar *v = jsvLock(jsVarFirstEmpty);
-    jsVarFirstEmpty = jsvGetNextSibling(v); // move our reference to the next in the free list
+    JsVar *v = jsvGetAddressOf(jsVarFirstEmpty); // jsvResetVariable will lock
+    jsVarFirstEmpty = jsvGetNextSibling(v); // move our reference to the next in the fr
     jshInterruptOn();
+    assert(v->flags == JSV_UNUSED);
+    // Cope with IRQs/multi-threading when getting a new free variable
+ /*   JsVarRef empty;
+    JsVarRef next;
+    JsVar *v;
+    do {
+      empty = jsVarFirstEmpty;
+      v = jsvGetAddressOf(empty); // jsvResetVariable will lock
+      next = jsvGetNextSibling(v); // move our reference to the next in the free list
+    } while (!__sync_bool_compare_and_swap(&jsVarFirstEmpty, empty, next));
+    assert(v->flags == JSV_UNUSED);*/
     jsvResetVariable(v, flags); // setup variable, and add one lock
     // return pointer
     return v;
   }
   jsErrorFlags |= JSERR_LOW_MEMORY;
   /* we don't have memory - second last hope - run garbage collector */
-  if (jsvGarbageCollect())
+  if (jsvGarbageCollect()) {
     return jsvNewWithFlags(flags); // if it freed something, continue
+  }
   /* we don't have memory - last hope - ask jsInteractive to try and free some it
    may have kicking around */
-  if (jsiFreeMoreMemory())
+  if (jsiFreeMoreMemory()) {
     return jsvNewWithFlags(flags);
+  }
   /* We couldn't claim any more memory by Garbage collecting... */
 #ifdef RESIZABLE_JSVARS
   jsvSetMemoryTotal(jsVarsSize*2);
@@ -343,11 +444,16 @@ ALWAYS_INLINE void jsvFreePtr(JsVar *var) {
 
   // Names that Link to other things
   if (jsvIsNameWithValue(var)) {
+#ifdef CLEAR_MEMORY_ON_FREE
     jsvSetFirstChild(var, 0); // it just contained random data - zero it
+#endif // CLEAR_MEMORY_ON_FREE
   } else if (jsvHasSingleChild(var)) {
     if (jsvGetFirstChild(var)) {
       JsVar *child = jsvLock(jsvGetFirstChild(var));
-      jsvUnRef(child); jsvSetFirstChild(var, 0); // unlink the child
+      jsvUnRef(child);
+#ifdef CLEAR_MEMORY_ON_FREE
+      jsvSetFirstChild(var, 0); // unlink the child
+#endif // CLEAR_MEMORY_ON_FREE
       jsvUnLock(child); // unlock should trigger a free
     }
   }
@@ -358,7 +464,9 @@ ALWAYS_INLINE void jsvFreePtr(JsVar *var) {
   if (jsvHasStringExt(var)) {
     // Free the string without recursing
     JsVarRef stringDataRef = jsvGetLastChild(var);
+#ifdef CLEAR_MEMORY_ON_FREE
     jsvSetLastChild(var, 0);
+#endif // CLEAR_MEMORY_ON_FREE
     while (stringDataRef) {
       JsVar *child = jsvGetAddressOf(stringDataRef);
       assert(jsvIsStringExt(child));
@@ -373,18 +481,25 @@ ALWAYS_INLINE void jsvFreePtr(JsVar *var) {
       // do it in reverse, so the free list ends up in kind of the right order
       while (count--) {
         JsVar *p = jsvGetAddressOf(i--);
-        p->flags = JSV_UNUSED; // just so the assert in jsvFreePtrInternal doesn't get fed up
+        p->flags = JSV_UNUSED; // set locks to 0 so the assert in jsvFreePtrInternal doesn't get fed up
         jsvFreePtrInternal(p);
       }
+    } else if (jsvIsBasicString(var)) {
+#ifdef CLEAR_MEMORY_ON_FREE
+      jsvSetFirstChild(var, 0); // firstchild could have had string data in
+#endif // CLEAR_MEMORY_ON_FREE
     }
+
   }
   /* NO ELSE HERE - because jsvIsNewChild stuff can be for Names, which
     can be ints or strings */
 
   if (jsvHasChildren(var)) {
     JsVarRef childref = jsvGetFirstChild(var);
+#ifdef CLEAR_MEMORY_ON_FREE
     jsvSetFirstChild(var, 0);
     jsvSetLastChild(var, 0);
+#endif // CLEAR_MEMORY_ON_FREE
     while (childref) {
       JsVar *child = jsvLock(childref);
       assert(jsvIsName(child));
@@ -395,13 +510,15 @@ ALWAYS_INLINE void jsvFreePtr(JsVar *var) {
       jsvUnLock(child);
     }
   } else {
+#ifdef CLEAR_MEMORY_ON_FREE
 #if JSVARREF_SIZE==1
     assert(jsvIsFloat(var) || !jsvGetFirstChild(var));
     assert(jsvIsFloat(var) || !jsvGetLastChild(var));
 #else
-    assert(!jsvGetFirstChild(var));
+    assert(!jsvGetFirstChild(var)); // strings use firstchild now as well
     assert(!jsvGetLastChild(var));
 #endif
+#endif // CLEAR_MEMORY_ON_FREE
     if (jsvIsName(var)) {
       assert(jsvGetNextSibling(var)==jsvGetPrevSibling(var)); // the case for jsvIsNewChild
       if (jsvGetNextSibling(var)) {
@@ -504,6 +621,7 @@ NO_INLINE void jsvUnLockMany(unsigned int count, JsVar **vars) {
 JsVar *jsvRef(JsVar *var) {
   assert(var && jsvHasRef(var));
   jsvSetRefs(var, (JsVarRefCounter)(jsvGetRefs(var)+1));
+  assert(jsvGetRefs(var));
   return var;
 }
 
@@ -511,8 +629,6 @@ JsVar *jsvRef(JsVar *var) {
 void jsvUnRef(JsVar *var) {
   assert(var && jsvGetRefs(var)>0 && jsvHasRef(var));
   jsvSetRefs(var, (JsVarRefCounter)(jsvGetRefs(var)-1));
-  // locks are never 0 here, so why bother checking!
-  assert(jsvGetLocks(var)>0);
 }
 
 /// Helper fn, Reference - set this variable as used by something
@@ -538,49 +654,91 @@ JsVarRef jsvUnRefRef(JsVarRef ref) {
 }
 
 JsVar *jsvNewFlatStringOfLength(unsigned int byteLength) {
+  if (isMemoryBusy) {
+    jsErrorFlags |= JSERR_MEMORY_BUSY;
+    return 0;
+  }
+  isMemoryBusy = true;
   // Work out how many blocks we need. One for the header, plus some for the characters
   size_t blocks = 1 + ((byteLength+sizeof(JsVar)-1) / sizeof(JsVar));
   // Now try and find them
   unsigned int blockCount = 0;
-  JsVarRef i;
+
+#ifdef RESIZABLE_JSVARS
+  JsVar *lastVar = 0;
+#endif
+
+  jsVarFirstEmpty = 0;
+  JsVar firstVar; // temporary var to simplify code in the loop below
+  jsvSetNextSibling(&firstVar, 0);
+  JsVar *lastEmpty = &firstVar;
+
+  JsVarRef i, j;
+
+  JsVar *flatString = 0;
   for (i=1;i<=jsVarsSize;i++)  {
     JsVar *var = jsvGetAddressOf(i);
     if ((var->flags&JSV_VARTYPEMASK) == JSV_UNUSED) {
+#ifdef RESIZABLE_JSVARS
+      /** With RESIZABLE_JSVARS (Linux), we have chunks of variables that may
+       * not be contiguous - so we can't allocate a flat string across them!  */
+      if (var != lastVar+1)
+        blockCount = 0;
+      lastVar = var;
+#endif
       blockCount++;
       if (blockCount>=blocks) { // Wohoo! We found enough blocks
-        var = jsvGetAddressOf((JsVarRef)(unsigned int)((unsigned)i+1-blocks)); // the first block
+        flatString = jsvGetAddressOf((JsVarRef)(unsigned int)((unsigned)i+1-blocks)); // the first block
         // Set up the header block (including one lock)
-        jsvResetVariable(var, JSV_FLAT_STRING);
-        var->varData.integer = (JsVarInt)byteLength;
+        jsvResetVariable(flatString, JSV_FLAT_STRING);
+        flatString->varData.integer = (JsVarInt)byteLength;
         // clear data
-        memset((char*)&var[1], 0, sizeof(JsVar)*(blocks-1));
-        // Now re-link all the free variables
-        jsvCreateEmptyVarList();
-        return var;
+        memset((char*)&flatString[1], 0, sizeof(JsVar)*(blocks-1));
+        // break out of the loop, and we'll return 'flatString'
+        i++; // we are already at the final block
+        break;
       }
     } else {
+      // we didn't have enough free blocks of memory,
+      // but we must add them to the free list again anyway
+      for (j=(JsVarRef)(i-blockCount);j<i;j++) {
+        JsVar *v = jsvGetAddressOf(j);
+        jsvSetNextSibling(lastEmpty, j);
+        lastEmpty = v;
+      }
+      // start again...
       blockCount = 0; // non-continuous
       if (jsvIsFlatString(var))
         i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
     }
   }
-  // can't make it - return undefined
-  return 0;
+  /* continue where we left off, and keep re-linking the
+   * free variable list */
+  for (;i<=jsVarsSize;i++)  {
+    JsVar *var = jsvGetAddressOf(i);
+    if ((var->flags&JSV_VARTYPEMASK) == JSV_UNUSED) {
+      jsvSetNextSibling(lastEmpty, i);
+      lastEmpty = var;
+    } else if (jsvIsFlatString(var)) {
+      // skip over used blocks for flat strings
+      i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
+    }
+  }
+  jsvSetNextSibling(lastEmpty, 0);
+  jsVarFirstEmpty = jsvGetNextSibling(&firstVar);
+  isMemoryBusy = false;
+  // Return whatever we had (0 if we couldn't manage it)
+  return flatString;
 }
 
 JsVar *jsvNewFromString(const char *str) {
   // Create a var
   JsVar *first = jsvNewWithFlags(JSV_STRING_0);
-  if (!first) {
-    jsWarn("Unable to create string as not enough memory");
-    return 0;
-  }
+  if (!first) return 0; // out of memory
   // Now we copy the string, but keep creating new jsVars if we go
   // over the end
   JsVar *var = jsvLockAgain(first);
   while (*str) {
-    // quickly set contents to 0
-    var->varData.integer = 0;
     // copy data in
     size_t i, l = jsvGetMaxCharactersInVar(var);
     for (i=0;i<l && *str;i++)
@@ -595,7 +753,7 @@ JsVar *jsvNewFromString(const char *str) {
     if (*str) {
       JsVar *next = jsvNewWithFlags(JSV_STRING_EXT_0);
       if (!next) {
-        jsWarn("Truncating string as not enough memory");
+        // Truncating string as not enough memory
         jsvUnLock(var);
         return first;
       }
@@ -617,27 +775,24 @@ JsVar *jsvNewStringOfLength(unsigned int byteLength) {
     jsWarn("Unable to create string as not enough memory");
     return 0;
   }
-  // Now zero the string, but keep creating new jsVars if we go
-  // over the end
+  // Now keep creating enough new jsVars
   JsVar *var = jsvLockAgain(first);
-  while (byteLength>0) {
+  while (true) {
     // copy data in
-    size_t i, l = jsvGetMaxCharactersInVar(var);
-    for (i=0;i<l && byteLength>0;i++,byteLength--)
-      var->varData.str[i] = 0;
-    // might as well shove a zero terminator on it if we can
-    if (i<l) var->varData.str[i]=0;
-    // we've stopped if the string was empty
-    jsvSetCharactersInVar(var, i);
-
-    // if there is still some left, it's because we filled up our var...
-    // make a new one, link it in, and unlock the old one.
-    if (byteLength>0) {
+    unsigned int l = (unsigned int)jsvGetMaxCharactersInVar(var);
+    if (l>=byteLength) {
+      // we've got enough
+      jsvSetCharactersInVar(var, byteLength);
+      break;
+    } else {
+      // We need more
+      jsvSetCharactersInVar(var, l);
+      byteLength -= l;
+      // Make a new one, link it in, and unlock the old one.
       JsVar *next = jsvNewWithFlags(JSV_STRING_EXT_0);
       if (!next) {
         jsWarn("Truncating string as not enough memory");
-        jsvUnLock(var);
-        return first;
+        break;
       }
       // we don't ref, because  StringExts are never reffed as they only have one owner (and ALWAYS have an owner)
       jsvSetLastChild(var, jsvGetRef(next));
@@ -680,7 +835,8 @@ JsVar *jsvMakeIntoVariableName(JsVar *var, JsVar *valueOrZero) {
   if (!var) return 0;
   assert(jsvGetRefs(var)==0); // make sure it's unused
   assert(jsvIsSimpleInt(var) || jsvIsString(var));
-  if ((var->flags & JSV_VARTYPEMASK)==JSV_INTEGER) {
+  JsVarFlags varType = (var->flags & JSV_VARTYPEMASK);
+  if (varType==JSV_INTEGER) {
     int t = JSV_NAME_INT;
     if ((jsvIsInt(valueOrZero) || jsvIsBoolean(valueOrZero)) && !jsvIsPin(valueOrZero)) {
       JsVarInt v = valueOrZero->varData.integer;
@@ -691,7 +847,43 @@ JsVar *jsvMakeIntoVariableName(JsVar *var, JsVar *valueOrZero) {
       }
     }
     var->flags = (JsVarFlags)(var->flags & ~JSV_VARTYPEMASK) | t;
-  } else if ((var->flags & JSV_VARTYPEMASK)>=JSV_STRING_0 && (var->flags & JSV_VARTYPEMASK)<=JSV_STRING_MAX) {
+  } else if (varType>=JSV_STRING_0 && varType<=JSV_STRING_MAX) {
+    if ((varType-JSV_STRING_0) > JSVAR_DATA_STRING_NAME_LEN) {
+      /* Argh. String is too large to fit in a JSV_NAME! We must chomp make
+       * new STRINGEXTs to put the data in
+       */
+      JsvStringIterator it;
+      jsvStringIteratorNew(&it, var, JSVAR_DATA_STRING_NAME_LEN);
+      JsVar *startExt = jsvNewWithFlags(JSV_STRING_EXT_0);
+      JsVar *ext = jsvLockAgainSafe(startExt);
+      size_t nChars = 0;
+      while (ext && jsvStringIteratorHasChar(&it)) {
+        if (nChars >= JSVAR_DATA_STRING_MAX_LEN) {
+          jsvSetCharactersInVar(ext, nChars);
+          JsVar *ext2 = jsvNewWithFlags(JSV_STRING_EXT_0);
+          if (ext2) {
+            jsvSetLastChild(ext, jsvGetRef(ext2));
+          }
+          jsvUnLock(ext);
+          ext = ext2;
+          nChars = 0;
+        }
+        ext->varData.str[nChars++] = jsvStringIteratorGetChar(&it);
+        jsvStringIteratorNext(&it);
+      }
+      jsvStringIteratorFree(&it);
+      if (ext) {
+        jsvSetCharactersInVar(ext, nChars);
+        jsvUnLock(ext);
+      }
+      jsvSetCharactersInVar(var, JSVAR_DATA_STRING_NAME_LEN);
+      jsvSetLastChild(var, jsvGetRef(startExt));
+      jsvSetNextSibling(var, 0);
+      jsvSetPrevSibling(var, 0);
+      jsvSetFirstChild(var, 0);
+      jsvUnLock(startExt);
+    }
+
     size_t t = JSV_NAME_STRING_0;
     if (jsvIsInt(valueOrZero) && !jsvIsPin(valueOrZero)) {
       JsVarInt v = valueOrZero->varData.integer;
@@ -723,9 +915,17 @@ JsVar *jsvNewFromPin(int pin) {
   return v;
 }
 
+JsVar *jsvNewObject() {
+  return jsvNewWithFlags(JSV_OBJECT);
+}
+
+JsVar *jsvNewEmptyArray() {
+  return jsvNewWithFlags(JSV_ARRAY);
+}
+
 /// Create an array containing the given elements
 JsVar *jsvNewArray(JsVar **elements, int elementCount) {
-  JsVar *arr = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *arr = jsvNewEmptyArray();
   if (!arr) return 0;
   int i;
   for (i=0;i<elementCount;i++)
@@ -760,7 +960,7 @@ JsVar *jsvNewArrayBufferFromString(JsVar *str, unsigned int lengthOrZero) {
   if (!arr) return 0;
   jsvSetFirstChild(arr, jsvGetRef(jsvRef(str)));
   arr->varData.arraybuffer.type = ARRAYBUFFERVIEW_ARRAYBUFFER;
-  arr->varData.arraybuffer.byteOffset = 0;
+  assert(arr->varData.arraybuffer.byteOffset == 0);
   if (lengthOrZero==0) lengthOrZero = (unsigned int)jsvGetStringLength(str);
   arr->varData.arraybuffer.length = (unsigned short)lengthOrZero;
   return arr;
@@ -838,7 +1038,8 @@ const char *jsvGetConstString(const JsVar *v) {
 /// Return the 'type' of the JS variable (eg. JS's typeof operator)
 const char *jsvGetTypeOf(const JsVar *v) {
   if (jsvIsUndefined(v)) return "undefined";
-  if (jsvIsNull(v) || jsvIsObject(v) || jsvIsArray(v)) return "object";
+  if (jsvIsNull(v) || jsvIsObject(v) ||
+      jsvIsArray(v) || jsvIsArrayBuffer(v)) return "object";
   if (jsvIsFunction(v)) return "function";
   if (jsvIsString(v)) return "string";
   if (jsvIsBoolean(v)) return "boolean";
@@ -924,7 +1125,7 @@ size_t jsvGetStringChars(const JsVar *v, size_t startChar, char *str, size_t len
 }
 
 /// Set the Data in this string. This must JUST overwrite - not extend or shrink
-void jsvSetString(JsVar *v, char *str, size_t len) {
+void jsvSetString(JsVar *v, const char *str, size_t len) {
   assert(jsvHasCharacterData(v));
   assert(len == jsvGetStringLength(v));
 
@@ -953,10 +1154,10 @@ JsVar *jsvAsString(JsVar *v, bool unlockVar) {
       // Function found and it's not the default one - execute it
       JsVar *result = jspExecuteFunction(toStringFn,v,0,0);
       jsvUnLock(toStringFn);
-      return jsvAsString(result, true);
+      str = jsvAsString(result, true);
     } else {
       jsvUnLock(toStringFn);
-      return jsvNewFromString("[object Object]");
+      str = jsvNewFromString("[object Object]");
     }
   } else {
     const char *constChar = jsvGetConstString(v);
@@ -1001,10 +1202,10 @@ JsVar *jsvAsFlatString(JsVar *var) {
     jsvStringIteratorNew(&src, str, 0);
     jsvStringIteratorNew(&dst, flat, 0);
     while (len--) {
-      jsvStringIteratorSetChar(&dst, jsvStringIteratorGetChar(&src));    
+      jsvStringIteratorSetChar(&dst, jsvStringIteratorGetChar(&src));
       if (len>0) {
         jsvStringIteratorNext(&src);
-        jsvStringIteratorNext(&dst);  
+        jsvStringIteratorNext(&dst);
       }
     }
     jsvStringIteratorFree(&src);
@@ -1055,20 +1256,18 @@ bool jsvIsEmptyString(JsVar *v) {
 size_t jsvGetStringLength(const JsVar *v) {
   size_t strLength = 0;
   const JsVar *var = v;
-  JsVarRef ref = 0;
-
+  JsVar *newVar = 0;
   if (!jsvHasCharacterData(v)) return 0;
 
   while (var) {
-    JsVarRef refNext = jsvGetLastChild(var);
+    JsVarRef ref = jsvGetLastChild(var);
     strLength += jsvGetCharactersInVar(var);
 
     // Go to next
-    if (ref) jsvUnLock(var); // note use of if (ref), not var
-    ref = refNext;
-    var = ref ? jsvLock(ref) : 0;
+    jsvUnLock(newVar); // note use of if (ref), not var
+    var = newVar = ref ? jsvLock(ref) : 0;
   }
-  if (ref) jsvUnLock(var); // note use of if (ref), not var
+  jsvUnLock(newVar); // note use of if (ref), not var
   return strLength;
 }
 
@@ -1081,6 +1280,40 @@ char *jsvGetFlatStringPointer(JsVar *v) {
   assert(jsvIsFlatString(v));
   if (!jsvIsFlatString(v)) return 0;
   return (char*)(v+1); // pointer to the next JsVar
+}
+
+JsVar *jsvGetFlatStringFromPointer(char *v) {
+  JsVar *secondVar = (JsVar*)v;
+  JsVar *flatStr = secondVar-1;
+  assert(jsvIsFlatString(flatStr));
+  return flatStr;
+}
+
+/// If the variable points to a *flat* area of memory, return a pointer (and set length). Otherwise return 0.
+char *jsvGetDataPointer(JsVar *v, size_t *len) {
+  assert(len);
+  if (jsvIsArrayBuffer(v)) {
+    /* Arraybuffers generally use some kind of string to store their data.
+     * Find it, then call ourselves again to figure out if we can get a
+     * raw pointer to it.  */
+    JsVar *d = jsvGetArrayBufferBackingString(v);
+    char *r = jsvGetDataPointer(d, len);
+    jsvUnLock(d);
+    if (r) {
+      r += v->varData.arraybuffer.byteOffset;
+      *len = v->varData.arraybuffer.length;
+    }
+    return r;
+  }
+  if (jsvIsNativeString(v)) {
+    *len = v->varData.nativeStr.len;
+    return (char*)v->varData.nativeStr.ptr;
+  }
+  if (jsvIsFlatString(v)) {
+    *len = jsvGetStringLength(v);
+    return jsvGetFlatStringPointer(v);
+  }
+  return 0;
 }
 
 //  IN A STRING  get the number of lines in the string (min=1)
@@ -1113,8 +1346,8 @@ size_t jsvGetCharsOnLine(JsVar *v, size_t line) {
   return chars;
 }
 
-//  IN A STRING, get the line and column of the given character. Both values must be non-null
-void jsvGetLineAndCol(JsVar *v, size_t charIdx, size_t* line, size_t *col) {
+//  IN A STRING, get the 1-based line and column of the given character. Both values must be non-null
+void jsvGetLineAndCol(JsVar *v, size_t charIdx, size_t *line, size_t *col) {
   size_t x = 1;
   size_t y = 1;
   size_t n = 0;
@@ -1386,6 +1619,16 @@ void jsvSetInteger(JsVar *v, JsVarInt value) {
   v->varData.integer  = value;
 }
 
+/**
+ * Get the boolean value of a variable.
+ * From a JavaScript variable, we determine its boolean value.  The rules
+ * are:
+ *
+ * * If integer, true if value is not 0.
+ * * If float, true if value is not 0.0.
+ * * If function, array or object, always true.
+ * * If string, true if length of string is greater than 0.
+ */
 bool jsvGetBool(const JsVar *v) {
   if (jsvIsString(v))
     return jsvGetStringLength((JsVar*)v)!=0;
@@ -1499,7 +1742,7 @@ JsVar *jsvArrayBufferGetFromName(JsVar *name) {
 
 
 JsVar *jsvGetFunctionArgumentLength(JsVar *functionScope) {
-  JsVar *args = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *args = jsvNewEmptyArray();
   if (!args) return 0; // out of memory
 
   JsvObjectIterator it;
@@ -1518,9 +1761,19 @@ JsVar *jsvGetFunctionArgumentLength(JsVar *functionScope) {
   return args;
 }
 
+/** Is this variable actually defined? eg, can we pass it into `jsvSkipName`
+ * without getting a ReferenceError? This also returns false if the variable
+ * if ok, but has the value `undefined`. */
+bool jsvIsVariableDefined(JsVar *a) {
+  return !jsvIsName(a) ||
+         jsvIsNameWithValue(a) ||
+         (jsvGetFirstChild(a)!=0);
+}
+
 /** If a is a name skip it and go to what it points to - and so on.
  * ALWAYS locks - so must unlock what it returns. It MAY
- * return 0. */
+ * return 0. Throws a ReferenceError if variable is not defined,
+ * but you can check if it will with jsvIsReferenceError */
 JsVar *jsvSkipName(JsVar *a) {
   JsVar *pa = a;
   if (!a) return 0;
@@ -1544,7 +1797,8 @@ JsVar *jsvSkipName(JsVar *a) {
 
 /** If a is a name skip it and go to what it points to.
  * ALWAYS locks - so must unlock what it returns. It MAY
- * return 0.  */
+ * return 0. Throws a ReferenceError if variable is not defined,
+ * but you can check if it will with jsvIsReferenceError */
 JsVar *jsvSkipOneName(JsVar *a) {
   JsVar *pa = a;
   if (!a) return 0;
@@ -1669,6 +1923,29 @@ int jsvCompareString(JsVar *va, JsVar *vb, size_t starta, size_t startb, bool eq
   return true;
 }
 
+/** Return a new string containing just the characters that are
+ * shared between two strings. */
+JsVar *jsvGetCommonCharacters(JsVar *va, JsVar *vb) {
+  JsVar *v = jsvNewFromEmptyString();
+  if (!v) return 0;
+  JsvStringIterator ita, itb;
+  jsvStringIteratorNew(&ita, va, 0);
+  jsvStringIteratorNew(&itb, vb, 0);
+  int ca = jsvStringIteratorGetCharOrMinusOne(&ita);
+  int cb = jsvStringIteratorGetCharOrMinusOne(&itb);
+  while (ca>0 && cb>0 && ca == cb) {
+    jsvAppendCharacter(v, (char)ca);
+    jsvStringIteratorNext(&ita);
+    jsvStringIteratorNext(&itb);
+    ca = jsvStringIteratorGetCharOrMinusOne(&ita);
+    cb = jsvStringIteratorGetCharOrMinusOne(&itb);
+  }
+  jsvStringIteratorFree(&ita);
+  jsvStringIteratorFree(&itb);
+  return v;
+}
+
+
 /** Compare 2 integers, >0 if va>vb,  <0 if va<vb. If compared with a non-integer, that gets put later */
 int jsvCompareInteger(JsVar *va, JsVar *vb) {
   if (jsvIsInt(va) && jsvIsInt(vb))
@@ -1686,6 +1963,7 @@ int jsvCompareInteger(JsVar *va, JsVar *vb) {
 JsVar *jsvCopyNameOnly(JsVar *src, bool linkChildren, bool keepAsName) {
   assert(jsvIsName(src));
   JsVarFlags flags = src->flags;
+  JsVar *dst = 0;
   if (!keepAsName) {
     JsVarFlags t = src->flags & JSV_VARTYPEMASK;
     if (t>=_JSV_NAME_INT_START && t<=_JSV_NAME_INT_END) {
@@ -1695,36 +1973,51 @@ JsVar *jsvCopyNameOnly(JsVar *src, bool linkChildren, bool keepAsName) {
           (JSV_NAME_STRING_0 < JSV_STRING_0) &&
           (JSV_STRING_0 < JSV_STRING_EXT_0)); // this relies on ordering
       assert(t>=JSV_NAME_STRING_INT_0 && t<=JSV_NAME_STRING_MAX);
-      flags = (flags & (JsVarFlags)~JSV_VARTYPEMASK) | (JSV_STRING_0 + jsvGetCharactersInVar(src));
+      if (jsvGetLastChild(src)) {
+        /* it's not a simple name string - it has STRING_EXT bits on the end.
+         * Because the max length of NAME and STRING is different we must just
+         * copy */
+        dst = jsvNewFromStringVar(src, 0, JSVAPPENDSTRINGVAR_MAXLENGTH);
+        if (!dst) return 0;
+      } else {
+        flags = (flags & (JsVarFlags)~JSV_VARTYPEMASK) | (JSV_STRING_0 + jsvGetCharactersInVar(src));
+      }
     }
   }
-  JsVar *dst = jsvNewWithFlags(flags & JSV_VARIABLEINFOMASK);
-  if (!dst) return 0; // out of memory
+  if (!dst) {
+    dst = jsvNewWithFlags(flags & JSV_VARIABLEINFOMASK);
+    if (!dst) return 0; // out of memory
 
-  memcpy(&dst->varData, &src->varData, JSVAR_DATA_STRING_LEN);
+    memcpy(&dst->varData, &src->varData, JSVAR_DATA_STRING_NAME_LEN);
 
-  jsvSetLastChild(dst, 0);
-  jsvSetFirstChild(dst, 0);
-  jsvSetPrevSibling(dst, 0);
-  jsvSetNextSibling(dst, 0);
+    assert(jsvGetLastChild(dst) == 0);
+    assert(jsvGetFirstChild(dst) == 0);
+    assert(jsvGetPrevSibling(dst) == 0);
+    assert(jsvGetNextSibling(dst) == 0);
+    // Copy extra string data if there was any
+    if (jsvHasStringExt(src)) {
+      // If it had extra string data it should have been handled above
+      assert(keepAsName || !jsvGetLastChild(src));
+      // copy extra bits of string if there were any
+      if (jsvGetLastChild(src)) {
+        JsVar *child = jsvLock(jsvGetLastChild(src));
+        JsVar *childCopy = jsvCopy(child);
+        if (childCopy) { // could be out of memory
+          jsvSetLastChild(dst, jsvGetRef(childCopy)); // no ref for stringext
+          jsvUnLock(childCopy);
+        }
+        jsvUnLock(child);
+      }
+    } else {
+      assert(jsvIsBasic(src)); // in case we missed something!
+    }
+  }
   // Copy LINK of what it points to
   if (linkChildren && jsvGetFirstChild(src)) {
-    jsvSetFirstChild(dst, jsvRefRef(jsvGetFirstChild(src)));
-  }
-  // Copy extra string data if there was any
-  if (jsvHasStringExt(src)) {
-    // copy extra bits of string if there were any
-    if (jsvGetLastChild(src)) {
-      JsVar *child = jsvLock(jsvGetLastChild(src));
-      JsVar *childCopy = jsvCopy(child);
-      if (childCopy) { // could be out of memory
-        jsvSetLastChild(dst, jsvGetRef(childCopy)); // no ref for stringext
-        jsvUnLock(childCopy);
-      }
-      jsvUnLock(child);
-    }
-  } else {
-    assert(jsvIsBasic(src)); // in case we missed something!
+    if (jsvIsNameWithValue(src))
+      jsvSetFirstChild(dst, jsvGetFirstChild(src));
+    else
+      jsvSetFirstChild(dst, jsvRefRef(jsvGetFirstChild(src)));
   }
   return dst;
 }
@@ -1737,16 +2030,18 @@ JsVar *jsvCopy(JsVar *src) {
   JsVar *dst = jsvNewWithFlags(src->flags & JSV_VARIABLEINFOMASK);
   if (!dst) return 0; // out of memory
   if (!jsvIsStringExt(src)) {
-    memcpy(&dst->varData, &src->varData, JSVAR_DATA_STRING_LEN);
-    jsvSetLastChild(dst, 0);
-    jsvSetFirstChild(dst, 0);
-    jsvSetPrevSibling(dst, 0);
-    jsvSetNextSibling(dst, 0);
+      memcpy(&dst->varData, &src->varData, (jsvIsBasicString(src)||jsvIsNativeString(src)) ? JSVAR_DATA_STRING_LEN : JSVAR_DATA_STRING_NAME_LEN);
+      if (!(jsvIsBasicString(src)||jsvIsNativeString(src))) {
+        assert(jsvGetPrevSibling(dst) == 0);
+        assert(jsvGetNextSibling(dst) == 0);
+        assert(jsvGetFirstChild(dst) == 0);
+      }
+      assert(jsvGetLastChild(dst) == 0);
   } else {
     // stringexts use the extra pointers after varData to store characters
     // see jsvGetMaxCharactersInVar
     memcpy(&dst->varData, &src->varData, JSVAR_DATA_STRING_MAX_LEN);
-    jsvSetLastChild(dst, 0);
+    assert(jsvGetLastChild(dst) == 0);
   }
 
   // Copy what names point to
@@ -2003,6 +2298,7 @@ JsVar *jsvFindChildFromVar(JsVar *parent, JsVar *childName, bool addIfNotFound) 
 
 void jsvRemoveChild(JsVar *parent, JsVar *child) {
   assert(jsvHasChildren(parent));
+  assert(jsvIsName(child));
   JsVarRef childref = jsvGetRef(child);
   bool wasChild = false;
   // unlink from parent
@@ -2123,10 +2419,12 @@ JsVar *jsvGetFirstName(JsVar *v) {
 
 JsVarInt jsvGetArrayLength(const JsVar *arr) {
   if (!arr) return 0;
+  assert(jsvIsArray(arr));
   return arr->varData.integer;
 }
 
 JsVarInt jsvSetArrayLength(JsVar *arr, JsVarInt length, bool truncate) {
+  assert(jsvIsArray(arr));
   if (truncate && length < arr->varData.integer) {
     // @TODO implement truncation here
   }
@@ -2253,7 +2551,7 @@ JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
 
 // Get all elements from arr and put them in itemPtr (unless it'd overflow).
 // Makes sure all of itemPtr either contains a JsVar or 0
-void jsvGetArrayItems(const JsVar *arr, unsigned int itemCount, JsVar **itemPtr) {
+void jsvGetArrayItems(JsVar *arr, unsigned int itemCount, JsVar **itemPtr) {
   JsvObjectIterator it;
   jsvObjectIteratorNew(&it, arr);
   unsigned int i = 0;
@@ -2274,7 +2572,7 @@ JsVar *jsvGetArrayIndexOf(JsVar *arr, JsVar *value, bool matchExact) {
   indexref = jsvGetFirstChild(arr);
   while (indexref) {
     JsVar *childIndex = jsvLock(indexref);
-    assert(jsvIsName(childIndex))
+    assert(jsvIsName(childIndex));
     JsVar *childValue = jsvSkipName(childIndex);
     if (childValue==value ||
         (!matchExact && jsvMathsOpTypeEqual(childValue, value))) {
@@ -2391,16 +2689,14 @@ JsVar *jsvArrayPopFirst(JsVar *arr) {
   }
 }
 
-/// Adds a new String element to the end of an array (IF it was not already there)
-void jsvArrayAddString(JsVar *arr, const char *text) {
-  JsVar *v = jsvNewFromString(text);
+/// Adds a new variable element to the end of an array (IF it was not already there). Return true if successful
+void jsvArrayAddUnique(JsVar *arr, JsVar *v) {
   JsVar *idx = jsvGetArrayIndexOf(arr, v, false); // did it already exist?
   if (!idx) {
-    jsvArrayPush(arr, v);
+    jsvArrayPush(arr, v); // if 0, it failed
   } else {
     jsvUnLock(idx);
   }
-  jsvUnLock(v);
 }
 
 /// Join all elements of an array together into a string
@@ -2512,6 +2808,10 @@ bool jsvMathsOpTypeEqual(JsVar *a, JsVar *b) {
     JsVar *contents = jsvMathsOp(a,b, LEX_EQUAL);
     if (!jsvGetBool(contents)) eql = false;
     jsvUnLock(contents);
+  } else {
+    /* Make sure we don't get in the situation where we have two equal
+     * strings with a check that fails because they were stored differently */
+    assert(!(jsvIsString(a) && jsvIsString(b) && jsvIsBasicVarEqual(a,b)));
   }
   return eql;
 }
@@ -2752,8 +3052,11 @@ void _jsvTrace(JsVar *var, int indent, JsVar *baseVar, int level) {
   if (jsvIsObject(var)) { jsiConsolePrint("Object { "); endBracket = '}'; }
   else if (jsvIsArray(var)) { jsiConsolePrintf("Array(%d) [ ", var->varData.integer); endBracket = ']'; }
   else if (jsvIsNativeFunction(var)) { jsiConsolePrintf("NativeFunction 0x%x (%d) { ", var->varData.native.ptr, var->varData.native.argTypes); endBracket = '}'; }
-  else if (jsvIsFunction(var)) { jsiConsolePrint("Function { "); endBracket = '}'; }
-  else if (jsvIsPin(var)) jsiConsolePrintf("Pin %d", jsvGetInteger(var));
+  else if (jsvIsFunction(var)) {
+    jsiConsolePrint("Function { ");
+    if (jsvIsFunctionReturn(var)) jsiConsolePrint("return ");
+    endBracket = '}';
+  } else if (jsvIsPin(var)) jsiConsolePrintf("Pin %d", jsvGetInteger(var));
   else if (jsvIsInt(var)) jsiConsolePrintf("Integer %d", jsvGetInteger(var));
   else if (jsvIsBoolean(var)) jsiConsolePrintf("Bool %s", jsvGetBool(var)?"true":"false");
   else if (jsvIsFloat(var)) jsiConsolePrintf("Double %f", jsvGetFloat(var));
@@ -2770,7 +3073,7 @@ void _jsvTrace(JsVar *var, int indent, JsVar *baseVar, int level) {
     if (jsvIsFlatString(var)) {
       blocks += jsvGetFlatStringBlocks(var);
     }
-    jsiConsolePrintf("%sString [%d blocks] %q", jsvIsFlatString(var)?"Flat":"", blocks, var);
+    jsiConsolePrintf("%sString [%d blocks] %q", jsvIsFlatString(var)?"Flat":(jsvIsNativeString(var)?"Native":""), blocks, var);
   } else {
     jsiConsolePrintf("Unknown %d", var->flags & (JsVarFlags)~(JSV_LOCK_MASK));
   }
@@ -2792,7 +3095,7 @@ void _jsvTrace(JsVar *var, int indent, JsVar *baseVar, int level) {
     JsvIterator it;
     jsvIteratorNew(&it, var);
     bool first = true;
-    while (jsvIteratorHasElement(&it)) {
+    while (jsvIteratorHasElement(&it) && !jspIsInterrupted()) {
       if (first) jsiConsolePrintf("\n");
       first = false;
       JsVar *child = jsvIteratorGetKey(&it);
@@ -2851,6 +3154,8 @@ static void jsvGarbageCollectMarkUsed(JsVar *var) {
 
 /** Run a garbage collection sweep - return true if things have been freed */
 bool jsvGarbageCollect() {
+  if (isMemoryBusy) return false;
+  isMemoryBusy = true;
   JsVarRef i;
   // clear garbage collect flags
   for (i=1;i<=jsVarsSize;i++)  {
@@ -2872,38 +3177,90 @@ bool jsvGarbageCollect() {
     if (jsvIsFlatString(var))
       i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
   }
-  // now sweep for things that we can GC!
+  /* now sweep for things that we can GC!
+   * Also update the free list - this means that every new variable that
+   * gets allocated gets allocated towards the start of memory, which
+   * hopefully helps compact everything towards the start. */
   bool freedSomething = false;
+  jsVarFirstEmpty = 0;
+  JsVar firstVar; // temporary var to simplify code in the loop below
+  jsvSetNextSibling(&firstVar, 0);
+  JsVar *lastEmpty = &firstVar;
   for (i=1;i<=jsVarsSize;i++)  {
     JsVar *var = jsvGetAddressOf(i);
     if (var->flags & JSV_GARBAGE_COLLECT) {
       freedSomething = true;
       if (jsvIsFlatString(var)) {
-        // if we're a flat string, there are more blocks to free
-        // work backwards, so our free list is in the right order
-        unsigned int count = 1 + (unsigned int)jsvGetFlatStringBlocks(var);
+        // If we're a flat string, there are more blocks to free.
+        unsigned int count = (unsigned int)jsvGetFlatStringBlocks(var);
+        // Free the first block
+        var->flags = JSV_UNUSED;
+        // add this to our free list
+        jsvSetNextSibling(lastEmpty, i);
+        lastEmpty = var;
+        // free subsequent blocks
         while (count-- > 0) {
-          var = jsvGetAddressOf(i+count);
+          i++;
+          var = jsvGetAddressOf((JsVarRef)(i));
           var->flags = JSV_UNUSED;
           // add this to our free list
-          jsvSetNextSibling(var, jsVarFirstEmpty);
-          jsVarFirstEmpty = jsvGetRef(var);
+          jsvSetNextSibling(lastEmpty, i);
+          lastEmpty = var;
         }
       } else {
         // otherwise just free 1 block
+        if (jsvHasSingleChild(var)) {
+          /* If this had a child that wasn't listed for GC then we need to
+           * unref it. Everything else is fine because it'll disappear anyway.
+           * We don't have to check if we should free this other variable
+           * here because we know the GC picked up it was referenced from
+           * somewhere else. */
+          JsVarRef ch = jsvGetFirstChild(var);
+          if (ch) {
+            JsVar *child = jsvGetAddressOf(ch); // not locked
+            if (child->flags!=JSV_UNUSED && // not already GC'd!
+                !(child->flags&JSV_GARBAGE_COLLECT)) // not marked for GC
+              jsvUnRef(child);
+          }
+        }
+        /* Sanity checks here. We're making sure that any variables that are
+         * linked from this one have either already been garbage collected or
+         * are marked for GC */
+        assert(!jsvHasChildren(var) || !jsvGetFirstChild(var) ||
+            jsvGetAddressOf(jsvGetFirstChild(var))->flags==JSV_UNUSED ||
+            (jsvGetAddressOf(jsvGetFirstChild(var))->flags&JSV_GARBAGE_COLLECT));
+        assert(!jsvHasChildren(var) || !jsvGetLastChild(var) ||
+            jsvGetAddressOf(jsvGetLastChild(var))->flags==JSV_UNUSED ||
+            (jsvGetAddressOf(jsvGetLastChild(var))->flags&JSV_GARBAGE_COLLECT));
+        assert(!jsvIsName(var) || !jsvGetPrevSibling(var) ||
+            jsvGetAddressOf(jsvGetPrevSibling(var))->flags==JSV_UNUSED ||
+            (jsvGetAddressOf(jsvGetPrevSibling(var))->flags&JSV_GARBAGE_COLLECT));
+        assert(!jsvIsName(var) || !jsvGetNextSibling(var) ||
+            jsvGetAddressOf(jsvGetNextSibling(var))->flags==JSV_UNUSED ||
+            (jsvGetAddressOf(jsvGetNextSibling(var))->flags&JSV_GARBAGE_COLLECT));
         // free!
         var->flags = JSV_UNUSED;
         // add this to our free list
-        jsvSetNextSibling(var, jsVarFirstEmpty);
-        jsVarFirstEmpty = jsvGetRef(var);
+        jsvSetNextSibling(lastEmpty, i);
+        lastEmpty = var;
       }
     } else if (jsvIsFlatString(var)) {
-      // if we have a flat string, skip that many blocks
+      // if we have a flat string, skip forward that many blocks
       i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
+    } else if (var->flags == JSV_UNUSED) {
+      // this is already free - add it to the free list
+      jsvSetNextSibling(lastEmpty, i);
+      lastEmpty = var;
     }
   }
+  /* Now find the first variable in our list, using
+   * our fake 'firstVar' variable */
+  jsvSetNextSibling(lastEmpty, 0);
+  jsVarFirstEmpty = jsvGetNextSibling(&firstVar);
+  isMemoryBusy = false;
   return freedSomething;
 }
+
 
 /** Remove whitespace to the right of a string - on MULTIPLE LINES */
 JsVar *jsvStringTrimRight(JsVar *srcString) {
@@ -2995,8 +3352,10 @@ bool jsvReadConfigObject(JsVar *object, jsvConfigObject *configs, int nConfigs) 
         }
       }
     }
-    if (!found)
-      jsWarn("Unknown option %q", key);
+    if (!found) {
+      jsExceptionHere(JSET_ERROR, "Unknown option %q", key);
+      ok = false;
+    }
     jsvUnLock(key);
 
     jsvObjectIteratorNext(&it);
@@ -3011,4 +3370,49 @@ JsVar *jsvNewTypedArray(JsVarDataArrayBufferViewType type, JsVarInt length) {
   JsVar *array = jswrap_typedarray_constructor(type, lenVar,0,0);
   jsvUnLock(lenVar);
   return array;
+}
+
+JsVar *jsvNewArrayBufferWithPtr(unsigned int length, char **ptr) {
+  assert(ptr);
+  *ptr=0;
+  JsVar *backingString = jsvNewFlatStringOfLength(length);
+  if (!backingString) return 0;
+  JsVar *arr = jsvNewArrayBufferFromString(backingString, length);
+  if (!arr) {
+    jsvUnLock(backingString);
+    return 0;
+  }
+  *ptr = jsvGetFlatStringPointer(backingString);
+  jsvUnLock(backingString);
+  return arr;
+}
+
+void *jsvMalloc(size_t size) {
+  /** Allocate flat string, return pointer to its first element.
+   * As we drop the pointer here, it's left locked. jsvGetFlatStringPointer
+   * is also safe if 0 is passed in.  */
+  JsVar *flatStr = jsvNewFlatStringOfLength(size);
+  if (!flatStr) {
+    jsErrorFlags |= JSERR_LOW_MEMORY;
+    // Not allocated - try and free any command history/etc
+    while (jsiFreeMoreMemory());
+    // Garbage collect
+    jsvGarbageCollect();
+    // Try again
+    flatStr = jsvNewFlatStringOfLength(size);
+  }
+  // intentionally no jsvUnLock - see above
+  void *p = (void*)jsvGetFlatStringPointer(flatStr);
+  if (p) {
+    //jsiConsolePrintf("jsvMalloc var %d-%d at %d (%d bytes)\n", jsvGetRef(flatStr), jsvGetRef(flatStr)+jsvGetFlatStringBlocks(flatStr), p, size);
+    memset(p,0,size);
+  }
+  return p;
+}
+
+void jsvFree(void *ptr) {
+  JsVar *flatStr = jsvGetFlatStringFromPointer((char *)ptr);
+  //jsiConsolePrintf("jsvFree var %d at %d (%d bytes)\n", jsvGetRef(flatStr), ptr, jsvGetLength(flatStr));
+
+  jsvUnLock(flatStr);
 }

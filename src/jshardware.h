@@ -9,8 +9,9 @@
  *
  * ----------------------------------------------------------------------------
  * Hardware interface Layer
- * NOTE: The definitions of these functions are inside:
+ * NOTE: Most definitions of these functions are inside:
  *                                         targets/{target}/jshardware.c
+ *       But common functions are inside:  src/jshardware_common.c
  * ----------------------------------------------------------------------------
  */
 
@@ -34,19 +35,19 @@ void jshInit();
 /// jshReset is called from JS 'reset()' - try to put peripherals back to their power-on state
 void jshReset();
 
-/** Code that is executed each time around the idle loop. Prod watchdog timers here, 
+/** Code that is executed each time around the idle loop. Prod watchdog timers here,
  * and on platforms without GPIO interrupts you can check watched Pins for changes. */
 void jshIdle();
-/** Enter sleep mode for the given period of time. Can be woken up by interrupts. 
+/** Enter sleep mode for the given period of time. Can be woken up by interrupts.
  * If time is 0xFFFFFFFFFFFFFFFF then go to sleep without setting a timer to wake
  * up.
- * 
+ *
  * This function can also check `jsiStatus & JSIS_ALLOW_DEEP_SLEEP`, and if there
  * is no pending serial data and nothing working on Timers, it will put the device
  * into deep sleep mode where the high speed oscillator turns off.
- * 
+ *
  * Returns true on success
- */ 
+ */
 bool jshSleep(JsSysTime timeUntilWake);
 
 /** Clean up ready to stop Espruino. Unused on embedded targets, but used on Linux,
@@ -55,7 +56,7 @@ void jshKill();
 
 /** Get this IC's serial number. Passed max # of chars and a pointer to write to.
  * Returns # of chars of non-null-terminated string.
- * 
+ *
  * This is reported back to `process.env` and is sometimes used in USB enumeration.
  * It doesn't have to be unique, but some users do use this in their code to distinguish
  * between boards.
@@ -64,15 +65,15 @@ int jshGetSerialNumber(unsigned char *data, int maxChars);
 
 /** Is the USB port connected such that we could move the console over to it
  * (and that we should store characters sent to USB). On non-USB boards this just returns false. */
-bool jshIsUSBSERIALConnected(); 
+bool jshIsUSBSERIALConnected();
 
 /** The system time is used all over Espruino - for:
  *  * setInterval/setTimeout
  *  * new Date()
  *  * getTime
- *  * scheduling the utility timer (digitalPulse/Waveform/etc) 
+ *  * scheduling the utility timer (digitalPulse/Waveform/etc)
  *  * timestamping watches (so measuring pulse widths)
- * 
+ *
  * It is time since 1970 - in whatever units make sense for the platform. For real-time
  * platforms units should really be at the uS level. Often this timer directly counts
  * clock cycles with the SysTick timer.
@@ -100,7 +101,8 @@ bool jshPinGetValue(Pin pin); ///< Get the value of a digital input. DOES NOT ch
 typedef enum {
   JSHPINSTATE_UNDEFINED,            ///< Used when getting the pin state, if we have no idea what it is.
   JSHPINSTATE_GPIO_OUT,             ///< GPIO pin as totem pole output
-  JSHPINSTATE_GPIO_OUT_OPENDRAIN,   ///< GPIO pin as open-collector/open-drain output WITH PULLUP
+  JSHPINSTATE_GPIO_OUT_OPENDRAIN,   ///< GPIO pin as open-collector/open-drain output WITHOUT PULLUP
+  JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP, ///< GPIO pin as open-collector/open-drain output WITH PULLUP
   JSHPINSTATE_GPIO_IN,              ///< GPIO pin as input (also tri-stated output)
   JSHPINSTATE_GPIO_IN_PULLUP,       ///< GPIO pin input with internal pull-up
   JSHPINSTATE_GPIO_IN_PULLDOWN,     ///< GPIO pin input with internal pull-down
@@ -115,13 +117,14 @@ typedef enum {
 
   /** Used by jshPinGetState to append information about whether the pin's output
    * is set to 1 or not. */
-  JSHPINSTATE_PIN_IS_ON = JSHPINSTATE_MASK+1,         
+  JSHPINSTATE_PIN_IS_ON = JSHPINSTATE_MASK+1,
 } PACKED_FLAGS JshPinState;
 
 /// Should a pin of this state be an output (inc open drain)
 #define JSHPINSTATE_IS_OUTPUT(state) ( \
              (state)==JSHPINSTATE_GPIO_OUT ||               \
              (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN ||     \
+             (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP || \
              (state)==JSHPINSTATE_AF_OUT ||                 \
              (state)==JSHPINSTATE_AF_OUT_OPENDRAIN ||       \
              (state)==JSHPINSTATE_USART_OUT ||              \
@@ -131,6 +134,7 @@ typedef enum {
 /// Should a pin of this state be Open Drain?
 #define JSHPINSTATE_IS_OPENDRAIN(state) ( \
              (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN ||     \
+             (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP || \
              (state)==JSHPINSTATE_AF_OUT_OPENDRAIN ||       \
              (state)==JSHPINSTATE_I2C              ||       \
 0)
@@ -145,6 +149,7 @@ typedef enum {
 /// Should a pin of this state have an internal pullup?
 #define JSHPINSTATE_IS_PULLUP(state) ( \
             (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN ||      \
+            (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP || \
             (state)==JSHPINSTATE_GPIO_IN_PULLUP ||          \
             (state)==JSHPINSTATE_USART_IN ||                \
 0)
@@ -157,16 +162,19 @@ typedef enum {
 /// Set the pin state (Output, Input, etc)
 void jshPinSetState(Pin pin, JshPinState state);
 
-/** Get the pin state (only accurate for simple IO - won't return 
- * JSHPINSTATE_USART_OUT for instance). Note that you should use 
- * JSHPINSTATE_MASK as other flags may have been added 
+/** Get the pin state (only accurate for simple IO - won't return
+ * JSHPINSTATE_USART_OUT for instance). Note that you should use
+ * JSHPINSTATE_MASK as other flags may have been added
  * (like JSHPINSTATE_PIN_IS_ON if pin was set to output) */
 JshPinState jshPinGetState(Pin pin);
 
-/// Returns an analog value between 0 and 1
+/** Returns an analog value between 0 and 1. 0 is expected to be 0v, and
+ * 1 means jshReadVRef() volts. On most devices jshReadVRef() would return
+ * around 3.3, so a reading of 1 represents 3.3v. */
 JsVarFloat jshPinAnalog(Pin pin);
 
 /** Returns a quickly-read analog value in the range 0-65535.
+ * This is basically `jshPinAnalog()*65535`
  * For use from an IRQ where high speed is needed */
 int jshPinAnalogFast(Pin pin);
 
@@ -183,27 +191,30 @@ JshPinFunction jshPinAnalogOutput(Pin pin, JsVarFloat value, JsVarFloat freq, Js
 /// Pulse a pin for a certain time, but via IRQs, not JS: `digitalWrite(pin,value);setTimeout("digitalWrite(pin,!value)", time*1000);`
 void jshPinPulse(Pin pin, bool value, JsVarFloat time);
 /// Can the given pin be watched? it may not be possible because of conflicts
-bool jshCanWatch(Pin pin); 
+bool jshCanWatch(Pin pin);
 /// start watching pin - return the EXTI (IRQ number flag) associated with it
-IOEventFlags jshPinWatch(Pin pin, bool shouldWatch); 
+IOEventFlags jshPinWatch(Pin pin, bool shouldWatch);
 
 /// Given a Pin, return the current pin function associated with it
 JshPinFunction jshGetCurrentPinFunction(Pin pin);
 
-/** Given a pin function, set that pin to the 16 bit value 
+/** Given a pin function, set that pin to the 16 bit value
  * (used mainly for fast DAC and PWM handling from Utility Timer) */
 void jshSetOutputValue(JshPinFunction func, int value);
 
-/// Enable watchdog with a timeout in seconds, it should be reset from `jshIdle`
+/// Enable watchdog with a timeout in seconds, it'll reset the chip if jshKickWatchDog isn't called within the timeout
 void jshEnableWatchDog(JsVarFloat timeout);
 
-/// Check the pin associated with this EXTI - return true if the pin's input is a logic 1 
+// Kick the watchdog
+void jshKickWatchDog();
+
+/// Check the pin associated with this EXTI - return true if the pin's input is a logic 1
 bool jshGetWatchedPinState(IOEventFlags device);
 
 /// Given an event, check the EXTI flags and see if it was for the given pin
 bool jshIsEventForPin(IOEvent *event, Pin pin);
 
-/** Is the given device initialised? 
+/** Is the given device initialised?
  * eg. has jshUSARTSetup/jshI2CSetup/jshSPISetup been called previously? */
 bool jshIsDeviceInitialised(IOEventFlags device);
 
@@ -216,7 +227,7 @@ bool jshIsDeviceInitialised(IOEventFlags device);
 /// Settings passed to jshUSARTSetup to set it the USART up
 typedef struct {
   int baudRate; // FIXME uint32_t ???
-  Pin pinRX; 
+  Pin pinRX;
   Pin pinTX;
   Pin pinCK;
   unsigned char bytesize; ///< size of byte, 7 or 8
@@ -226,16 +237,7 @@ typedef struct {
 } PACKED_FLAGS JshUSARTInfo;
 
 /// Initialise a JshUSARTInfo struct to default settings
-static inline void jshUSARTInitInfo(JshUSARTInfo *inf) {
-  inf->baudRate = DEFAULT_BAUD_RATE;
-  inf->pinRX    = PIN_UNDEFINED;
-  inf->pinTX    = PIN_UNDEFINED;
-  inf->pinCK    = PIN_UNDEFINED;
-  inf->bytesize = DEFAULT_BYTESIZE;
-  inf->parity   = DEFAULT_PARITY; // PARITY_NONE = 0, PARITY_ODD = 1, PARITY_EVEN = 2 FIXME: enum?
-  inf->stopbits = DEFAULT_STOPBITS;
-  inf->xOnXOff = false;
-}
+void jshUSARTInitInfo(JshUSARTInfo *inf); // jshardware_common.c
 
 /** Set up a UART, if pins are -1 they will be guessed */
 void jshUSARTSetup(IOEventFlags device, JshUSARTInfo *inf);
@@ -243,7 +245,7 @@ void jshUSARTSetup(IOEventFlags device, JshUSARTInfo *inf);
 /** Kick a device into action (if required). For instance we may have data ready
  * to sent to a USART, but we need to enable the IRQ such that it can automatically
  * fetch the characters to send.
- * 
+ *
  * Later down the line this could potentially even set up something like DMA.*/
 void jshUSARTKick(IOEventFlags device);
 
@@ -284,16 +286,7 @@ typedef struct {
 
 
 /// Initialise a JshSPIInfo struct to default settings
-static inline void jshSPIInitInfo(JshSPIInfo *inf) {
-  inf->baudRate     = 100000;
-  inf->baudRateSpec = SPIB_DEFAULT;
-  inf->pinSCK       = PIN_UNDEFINED;
-  inf->pinMISO      = PIN_UNDEFINED;
-  inf->pinMOSI      = PIN_UNDEFINED;
-  inf->spiMode      = SPIF_SPI_MODE_0;
-  inf->spiMSB       = true; // MSB first is default
-}
-
+void jshSPIInitInfo(JshSPIInfo *inf); // jshardware_common.c
 
 /** Set up SPI, if pins are -1 they will be guessed */
 void jshSPISetup(IOEventFlags device, JshSPIInfo *inf);
@@ -314,18 +307,13 @@ void jshSPIWait(IOEventFlags device);
 typedef struct {
   Pin pinSCL;
   Pin pinSDA;
-  char slaveAddr; // or -1 if it is master!
-  int bitrate;
-  // timeout?
+  int bitrate;  ///< bits per second
+  bool started; ///< Has I2C 'start' condition been sent so far?
 } PACKED_FLAGS JshI2CInfo;
 
 /// Initialise a JshI2CInfo struct to default settings
-static inline void jshI2CInitInfo(JshI2CInfo *inf) {
-  inf->pinSCL = PIN_UNDEFINED;
-  inf->pinSDA = PIN_UNDEFINED;
-  inf->slaveAddr = (char)-1; // master
-  inf->bitrate = 50000; // Is what we used - shouldn't it be 100k?
-}
+void jshI2CInitInfo(JshI2CInfo *inf); // jshardware_common.c
+
 /** Set up I2C, if pins are -1 they will be guessed */
 void jshI2CSetup(IOEventFlags device, JshI2CInfo *inf);
 
@@ -338,6 +326,10 @@ void jshI2CRead(IOEventFlags device, unsigned char address, int nBytes, unsigned
 /** Return start address and size of the flash page the given address resides in. Returns false if
   * the page is outside of the flash address range */
 bool jshFlashGetPage(uint32_t addr, uint32_t *startAddr, uint32_t *pageSize);
+/** Return a JsVar array containing objects of the form `{addr, length}` for each contiguous block of free
+ * memory available. These should be one complete pages, so that erasing the page containing any address in
+ * this block won't erase anything useful! */
+JsVar *jshFlashGetFree();
 /// Erase the flash page containing the address
 void jshFlashErasePage(uint32_t addr);
 /** Read data from flash memory into the buffer, the flash address has no alignment restrictions
@@ -348,14 +340,14 @@ void jshFlashRead(void *buf, uint32_t addr, uint32_t len);
 void jshFlashWrite(void *buf, uint32_t addr, uint32_t len);
 
 
-/** Utility timer handling functions 
+/** Utility timer handling functions
  *  ------------------------------------------
  * The utility timer is intended to generate an interrupt and then call jstUtilTimerInterruptHandler
  * as interrupt handler so Espruino can process tasks that are queued up on the timer. Typical
  * functions used in the interrupt handler include reading/write GPIO pins, reading analog and
  * writing analog. See jstimer.c for the implementation.
- * 
- * These are exposed through functions like `jsDigitalPulse`, `analogWrite(..., {soft:true})` 
+ *
+ * These are exposed through functions like `jsDigitalPulse`, `analogWrite(..., {soft:true})`
  * and the `Waveform` class.
  */
 
@@ -376,20 +368,35 @@ void jshDoSysTick();
 #ifdef STM32
 // push a byte into SPI buffers (called from IRQ)
 void jshSPIPush(IOEventFlags device, uint16_t data);
+
+typedef enum {
+  JSGPAF_INPUT,
+  JSGPAF_OUTPUT,
+} JshGetPinAddressFlags;
+// Get the address to read/write to in order to change the state of this pin. Or 0.
+volatile uint32_t *jshGetPinAddress(Pin pin, JshGetPinAddressFlags flags);
 #endif
 
 /// the temperature from the internal temperature sensor, in degrees C
 JsVarFloat jshReadTemperature();
+
 /// The voltage that a reading of 1 from `analogRead` actually represents, in volts
 JsVarFloat jshReadVRef();
+
 /** Get a random number - either using special purpose hardware or by
  * reading noise from an analog input. If unimplemented, this should
  * default to `rand()` */
 unsigned int jshGetRandomNumber();
 
+/** Change the processor clock info. What's in options is platform
+ * specific - you should update the docs for jswrap_espruino_setClock
+ * to match what gets implemented here. The return value is the clock
+ * speed in Hz though. */
+unsigned int jshSetSystemClock(JsVar *options);
+
 /** Hacky definition of wait cycles used for WAIT_UNTIL.
  * TODO: make this depend on known system clock speed? */
-#if defined(STM32F401xx)
+#if defined(STM32F401xx) || defined(STM32F411xx)
 #define WAIT_UNTIL_N_CYCLES 2000000
 #elif defined(STM32F4)
 #define WAIT_UNTIL_N_CYCLES 5000000

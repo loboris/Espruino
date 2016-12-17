@@ -39,12 +39,13 @@ You can call the methods on Pin, or you can use Wiring-style functions such as d
 }
 Creates a pin from the given argument (or returns undefined if no argument)
 */
-/**
- * Create an instance of a Pin class.
- */
 JsVar *jswrap_pin_constructor(JsVar *val) {
   Pin pin = jshGetPinFromVar(val);
   if (!jshIsPinValid(pin)) return 0;
+#ifdef ESP8266
+  if (jsvIsInt(val) && !jsvIsPin(val))
+    jsWarn("The Pin() constructor is deprecated. Please use `D%d`, or NodeMCU.Dx instead", pin);
+#endif
   return jsvNewFromPin(pin);
 }
 
@@ -170,6 +171,7 @@ void jswrap_pin_mode(JsVar *parent, JsVar *mode) {
   "type"     : "method",
   "class"    : "Pin",
   "name"     : "getInfo",
+  "ifndef"   : "SAVE_ON_FLASH",
   "generate" : "jswrap_pin_getInfo",
   "return"   : ["JsVar","An object containing information about this pins"]
 }
@@ -177,9 +179,11 @@ Get information about this pin and its capabilities. Of the form:
 
 ```
 {
-  "port" : "A", // the Pin's port on the chip
-  "num" : 12, // the Pin's number
-  "analog" : { ADCs : [1], channel : 12 }, // If analog input is available
+  "port"      : "A", // the Pin's port on the chip
+  "num"       : 12, // the Pin's number
+  "in_addr"   : 0x..., // (if available) the address of the pin's input address in bit-banded memory (can be used with peek)
+  "out_addr"  : 0x..., // (if available) the address of the pin's output address in bit-banded memory (can be used with poke)
+  "analog"    : { ADCs : [1], channel : 12 }, // If analog input is available
   "functions" : {
     "TIM1":{type:"CH1, af:0},
     "I2C3":{type:"SCL", af:1}
@@ -188,16 +192,13 @@ Get information about this pin and its capabilities. Of the form:
 ```
 Will return undefined if pin is not valid.
 */
-/**
- *
- */
 JsVar *jswrap_pin_getInfo(
     JsVar *parent //!< The class instance representing the pin.
   ) {
   Pin pin = jshGetPinFromVar(parent);
   if (!jshIsPinValid(pin)) return 0;
   const JshPinInfo *inf = &pinInfo[pin];
-  JsVar *obj = jsvNewWithFlags(JSV_OBJECT);
+  JsVar *obj = jsvNewObject();
   if (!obj) return 0;
 
   char buf[2];
@@ -205,11 +206,18 @@ JsVar *jswrap_pin_getInfo(
   buf[1] = 0;
   jsvObjectSetChildAndUnLock(obj, "port", jsvNewFromString(buf));
   jsvObjectSetChildAndUnLock(obj, "num", jsvNewFromInteger(inf->pin-JSH_PIN0));
+#ifdef STM32
+  volatile uint32_t *addr;
+  addr = jshGetPinAddress(pin, JSGPAF_INPUT);
+  if (addr) jsvObjectSetChildAndUnLock(obj, "in_addr", jsvNewFromInteger((JsVarInt)addr));
+  addr = jshGetPinAddress(pin, JSGPAF_OUTPUT);
+  if (addr) jsvObjectSetChildAndUnLock(obj, "out_addr", jsvNewFromInteger((JsVarInt)addr));
+#endif
   // ADC
   if (inf->analog) {
-    JsVar *an = jsvNewWithFlags(JSV_OBJECT);
+    JsVar *an = jsvNewObject();
     if (an) {
-      JsVar *arr = jsvNewWithFlags(JSV_ARRAY);
+      JsVar *arr = jsvNewEmptyArray();
       if (arr) {
         int i;
         for (i=0;i<ADC_COUNT;i++)
@@ -220,12 +228,12 @@ JsVar *jswrap_pin_getInfo(
       jsvObjectSetChildAndUnLock(obj, "channel", jsvNewFromInteger(inf->analog & JSH_MASK_ANALOG_CH));
     }
   }
-  JsVar *funcs = jsvNewWithFlags(JSV_OBJECT);
+  JsVar *funcs = jsvNewObject();
   if (funcs) {
     int i;
     for (i=0;i<JSH_PININFO_FUNCTIONS;i++) {
       if (inf->functions[i]) {
-        JsVar *func = jsvNewWithFlags(JSV_OBJECT);
+        JsVar *func = jsvNewObject();
         if (func) {
           char buf[16];
           jshPinFunctionToString(inf->functions[i], JSPFTS_TYPE, buf, sizeof(buf));

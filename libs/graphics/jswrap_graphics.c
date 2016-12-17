@@ -335,6 +335,44 @@ void jswrap_graphics_drawRect(JsVar *parent, int x1, int y1, int x2, int y2) {
 /*JSON{
   "type" : "method",
   "class" : "Graphics",
+  "name" : "fillCircle",
+  "generate" : "jswrap_graphics_fillCircle",
+  "params" : [
+    ["x","int32","The X axis"],
+    ["y","int32","The Y axis"],
+    ["rad","int32","The circle radius"]
+  ]
+}
+Draw a filled circle in the Foreground Color
+*/
+ void jswrap_graphics_fillCircle(JsVar *parent, int x, int y, int rad) {
+   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
+   graphicsFillCircle(&gfx, (short)x,(short)y,(short)rad);
+   graphicsSetVar(&gfx); // gfx data changed because modified area
+ }
+
+/*JSON{
+  "type" : "method",
+  "class" : "Graphics",
+  "name" : "drawCircle",
+  "generate" : "jswrap_graphics_drawCircle",
+  "params" : [
+    ["x","int32","The X axis"],
+    ["y","int32","The Y axis"],
+    ["rad","int32","The circle radius"]
+  ]
+}
+Draw an unfilled circle 1px wide in the Foreground Color
+*/
+void jswrap_graphics_drawCircle(JsVar *parent, int x, int y, int rad) {
+  JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
+  graphicsDrawCircle(&gfx, (short)x,(short)y,(short)rad);
+  graphicsSetVar(&gfx); // gfx data changed because modified area
+}
+
+/*JSON{
+  "type" : "method",
+  "class" : "Graphics",
   "name" : "getPixel",
   "generate" : "jswrap_graphics_getPixel",
   "params" : [
@@ -366,7 +404,7 @@ Set a pixel's color
 void jswrap_graphics_setPixel(JsVar *parent, int x, int y, JsVar *color) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
   unsigned int col = gfx.data.fgColor;
-  if (!jsvIsUndefined(color)) 
+  if (!jsvIsUndefined(color))
     col = (unsigned int)jsvGetInteger(color);
   graphicsSetPixel(&gfx, (short)x, (short)y, col);
   gfx.data.cursorX = (short)x;
@@ -498,7 +536,7 @@ JsVarInt jswrap_graphics_getColorX(JsVar *parent, bool isForeground) {
   "name" : "setFontBitmap",
   "generate_full" : "jswrap_graphics_setFontSizeX(parent, JSGRAPHICS_FONTSIZE_4X6, false)"
 }
-Set Graphics to draw with a Bitmapped Font
+Make subsequent calls to `drawString` use the built-in 4x6 pixel bitmapped Font
 */
 /*JSON{
   "type" : "method",
@@ -507,10 +545,10 @@ Set Graphics to draw with a Bitmapped Font
   "ifndef" : "SAVE_ON_FLASH",
   "generate_full" : "jswrap_graphics_setFontSizeX(parent, size, true)",
   "params" : [
-    ["size","int32","The size as an integer"]
+    ["size","int32","The height of the font, as an integer"]
   ]
 }
-Set Graphics to draw with a Vector Font of the given size
+Make subsequent calls to `drawString` use a Vector Font of the given height
 */
 void jswrap_graphics_setFontSizeX(JsVar *parent, int size, bool checkValid) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
@@ -540,7 +578,8 @@ void jswrap_graphics_setFontSizeX(JsVar *parent, int size, bool checkValid) {
     ["height","int32","The height as an integer"]
   ]
 }
-Set Graphics to draw with a Custom Font
+Make subsequent calls to `drawString` use a Custom Font of the given height. See the [Fonts page](http://www.espruino.com/Fonts) for more
+information about custom fonts and how to create them.
 */
 void jswrap_graphics_setFontCustom(JsVar *parent, JsVar *bitmap, int firstChar, JsVar *width, int height) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
@@ -577,8 +616,8 @@ void jswrap_graphics_setFontCustom(JsVar *parent, JsVar *bitmap, int firstChar, 
   "generate" : "jswrap_graphics_drawString",
   "params" : [
     ["str","JsVar","The string"],
-    ["x","int32","The left"],
-    ["y","int32","The top"]
+    ["x","int32","The X position of the leftmost pixel"],
+    ["y","int32","The Y position of the topmost pixel"]
   ]
 }
 Draw a string of text in the current font
@@ -587,7 +626,7 @@ void jswrap_graphics_drawString(JsVar *parent, JsVar *var, int x, int y) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return;
 
   JsVar *customBitmap = 0, *customWidth = 0;
-  int customHeight, customFirstChar;
+  int customHeight = 0, customFirstChar = 0;
   if (gfx.data.fontSize == JSGRAPHICS_FONTSIZE_CUSTOM) {
     customBitmap = jsvObjectGetChild(parent, JSGRAPHICS_CUSTOMFONT_BMP, 0);
     customWidth = jsvObjectGetChild(parent, JSGRAPHICS_CUSTOMFONT_WIDTH, 0);
@@ -672,7 +711,7 @@ JsVarInt jswrap_graphics_stringWidth(JsVar *parent, JsVar *var) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return 0;
 
   JsVar *customWidth = 0;
-  int customFirstChar;
+  int customFirstChar = 0;
   if (gfx.data.fontSize == JSGRAPHICS_FONTSIZE_CUSTOM) {
     customWidth = jsvObjectGetChild(parent, JSGRAPHICS_CUSTOMFONT_WIDTH, 0);
     customFirstChar = (int)jsvGetIntegerAndUnLock(jsvObjectGetChild(parent, JSGRAPHICS_CUSTOMFONT_FIRSTCHAR, 0));
@@ -927,7 +966,7 @@ JsVar *jswrap_graphics_getModified(JsVar *parent, bool reset) {
   JsGraphics gfx; if (!graphicsGetFromVar(&gfx, parent)) return 0;
   JsVar *obj = 0;
   if (gfx.data.modMinX <= gfx.data.modMaxX) { // do we have a rect?
-    obj = jsvNewWithFlags(JSV_OBJECT);
+    obj = jsvNewObject();
     if (obj) {
       jsvObjectSetChildAndUnLock(obj, "x1", jsvNewFromInteger(gfx.data.modMinX));
       jsvObjectSetChildAndUnLock(obj, "y1", jsvNewFromInteger(gfx.data.modMinY));

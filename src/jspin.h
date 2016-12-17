@@ -208,6 +208,8 @@ Pin jshGetPinFromVarAndUnLock(JsVar *pinv);
 bool jshGetPinStateIsManual(Pin pin);
 /// Set whether the pin state is manual (has the user asked us explicitly to change it?)
 void jshSetPinStateIsManual(Pin pin, bool manual);
+// Reset our list of which pins are set manually - called from jshResetDevices
+void jshResetPinStateIsManual();
 
 bool jshPinInput(Pin pin);
 void jshPinOutput(Pin pin, bool value);
@@ -226,7 +228,8 @@ typedef enum {
   JSPFTS_DEVICE        = 1, ///< The device itself
   JSPFTS_DEVICE_NUMBER = 2, ///< The device's number
   JSPFTS_SPACE         = 4, ///< A space between device and pin type
-  JSPFTS_TYPE          = 8  ///< The pin type (RX/TX/etc)
+  JSPFTS_TYPE          = 8,  ///< The pin type (RX/TX/etc)
+  JSPFTS_JS_NAMES      = 16 //< Use JS names - eg. Serial, not USART
 } JshPinFunctionToStringFlags;
 
 /// Given a full pin function, return a string describing it depending of what's in the flags enum

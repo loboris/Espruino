@@ -320,7 +320,7 @@ JsVar *jswrap_string_slice(JsVar *parent, JsVarInt pStart, JsVar *vEnd) {
 Return an array made by splitting this string up by the separator. eg. ```'1,2,3'.split(',')==[1,2,3]```
  */
 JsVar *jswrap_string_split(JsVar *parent, JsVar *split) {
-  JsVar *array = jsvNewWithFlags(JSV_ARRAY);
+  JsVar *array = jsvNewEmptyArray();
   if (!array) return 0; // out of memory
 
   if (jsvIsUndefined(split)) {
@@ -406,9 +406,8 @@ JsVar *jswrap_string_toUpperLowerCase(JsVar *parent, bool upper) {
   "return" : ["JsVar","A String with Whitespace removed from the beginning and end"],
   "return_object" : "String"
 }
-Return the integer value of a single character at the given position in the String.
-
-Note that this returns 0 not 'NaN' for out of bounds characters
+Return a new string with any whitespace (tabs, space, form feed, newline,
+carriage return, etc) removed from the beginning and end.
  */
 JsVar *jswrap_string_trim(JsVar *parent) {
   JsVar *s = jsvAsString(parent, false);

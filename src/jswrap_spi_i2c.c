@@ -14,6 +14,7 @@
  * ----------------------------------------------------------------------------
  */
 #include "jsspi.h"
+#include "jsi2c.h"
 #include "jswrap_spi_i2c.h"
 #include "jsdevices.h"
 #include "jsinteractive.h"
@@ -62,7 +63,7 @@ Create a software SPI port. This has limited functionality (no baud rate), but i
 Use `SPI.setup` to configure this port.
  */
 JsVar *jswrap_spi_constructor() {
-  return jsvNewWithFlags(JSV_OBJECT);
+  return jsvNewObject();
 }
 
 /*JSON{
@@ -109,7 +110,7 @@ void jswrap_spi_setup(
   // Debug
   // jsiConsolePrintf("jswrap_spi_setup called parent=%v, options=%v\n", parent, options);
 
-  jsspiPopulateSPIInfo(&inf, options);
+  if (!jsspiPopulateSPIInfo(&inf, options)) return;
 
   if (DEVICE_IS_SPI(device)) {
     jshSPISetup(device, &inf);
@@ -163,7 +164,7 @@ typedef struct {
 
 
 /**
- * Send a single byte to the SPI device, used ad callback.
+ * Send a single byte to the SPI device, used as callback.
  */
 void jswrap_spi_send_cb(
     int c,                     //!< The byte to send through SPI.
@@ -214,7 +215,9 @@ JsVar *jswrap_spi_send(
 
   // Handle the data being a single byte value
   if (jsvIsNumeric(srcdata)) {
-    int r = data.spiSend((unsigned char)jsvGetInteger(srcdata), &data.spiSendData);
+    int d = jsvGetInteger(srcdata);
+    if (d<0) d = 0; // protect against -1 as we use this in the jshardware SPI implementation
+    int r = data.spiSend(d, &data.spiSendData);
     if (r<0) r = data.spiSend(-1, &data.spiSendData);
     dst = jsvNewFromInteger(r); // retrieve the byte (no send!)
   }
@@ -242,9 +245,8 @@ JsVar *jswrap_spi_send(
       unsigned char out = (unsigned char)data.spiSend(-1, &data.spiSendData);
       jsvAppendStringBuf(dst, (char*)&out, 1);
     }
-  }
-  // Handle the data being an iterable.
-  else {
+  } else {
+    // Handle the data being an iterable.
     int nBytes = jsvIterateCallbackCount(srcdata);
     dst = jsvNewTypedArray(ARRAYBUFFERVIEW_UINT8, nBytes);
     if (dst) {
@@ -296,7 +298,7 @@ void jswrap_spi_write(
   if (len > 0) {
     JsVar *last = jsvGetArrayItem(args, len-1); // look at the last value
     if (jsvIsPin(last)) {
-      nss_pin = jshGetPinFromVar(last);    
+      nss_pin = jshGetPinFromVar(last);
       jsvUnLock(jsvArrayPop(args));
     }
     jsvUnLock(last);
@@ -462,6 +464,19 @@ This class allows use of the built-in I2C ports. Currently it allows I2C Master 
 
 All addresses are in 7 bit format. If you have an 8 bit address then you need to shift it one bit to the right.
  */
+/*JSON{
+  "type" : "constructor",
+  "class" : "I2C",
+  "name" : "I2C",
+  "generate" : "jswrap_i2c_constructor"
+}
+Create a software I2C port. This has limited functionality (no baud rate), but it can work on any pins.
+
+Use `SPI.setup` to configure this port.
+ */
+JsVar *jswrap_i2c_constructor() {
+  return jsvNewObject();
+}
 
 /*JSON{
   "type" : "staticmethod",
@@ -520,22 +535,27 @@ If not specified in options, the default pins are used (usually the lowest numbe
  */
 void jswrap_i2c_setup(JsVar *parent, JsVar *options) {
   IOEventFlags device = jsiGetDeviceFromClass(parent);
-  if (!DEVICE_IS_I2C(device)) return;
   JshI2CInfo inf;
-  jshI2CInitInfo(&inf);
-  if (jsvIsObject(options)) {
-    inf.pinSCL = jshGetPinFromVarAndUnLock(jsvObjectGetChild(options, "scl", 0));
-    inf.pinSDA = jshGetPinFromVarAndUnLock(jsvObjectGetChild(options, "sda", 0));
-    JsVar *v = jsvObjectGetChild(options, "bitrate", 0);
-    if (v)
-      inf.bitrate = jsvGetIntegerAndUnLock(v);
+  if (jsi2cPopulateI2CInfo(&inf, options)) {
+    if (DEVICE_IS_I2C(device)) {
+      jshI2CSetup(device, &inf);
+    } else if (device == EV_NONE) {
+      // software mode - at least configure pins properly
+      if (inf.pinSCL != PIN_UNDEFINED) {
+        jshPinSetValue(inf.pinSCL, 1);
+        jshPinSetState(inf.pinSCL,  JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP);
+      }
+      if (inf.pinSDA != PIN_UNDEFINED) {
+        jshPinSetValue(inf.pinSDA, 1);
+        jshPinSetState(inf.pinSDA,  JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP);
+      }
+    }
+    // Set up options, so we can initialise it on startup
+    if (options)
+      jsvUnLock(jsvSetNamedChild(parent, options, DEVICE_OPTIONS_NAME));
+    else
+      jsvRemoveNamedChild(parent, DEVICE_OPTIONS_NAME);
   }
-  jshI2CSetup(device, &inf);
-  // Set up options, so we can initialise it on startup
-  if (options)
-    jsvUnLock(jsvSetNamedChild(parent, options, DEVICE_OPTIONS_NAME));
-  else
-    jsvRemoveNamedChild(parent, DEVICE_OPTIONS_NAME);
 }
 
 
@@ -565,21 +585,26 @@ Transmit to the slave device with the given address. This is like Arduino's begi
 
 void jswrap_i2c_writeTo(JsVar *parent, JsVar *addressVar, JsVar *args) {
   IOEventFlags device = jsiGetDeviceFromClass(parent);
-  if (!DEVICE_IS_I2C(device)) return;
 
   bool sendStop = true;
   int address = i2c_get_address(addressVar, &sendStop);
 
-  size_t l = (size_t)jsvIterateCallbackCount(args);
-  if (l+256 > jsuGetFreeStack()) {
-    jsExceptionHere(JSET_ERROR, "Not enough free stack to send this amount of data");
-    return;
+  JSV_GET_AS_CHAR_ARRAY( dataPtr, dataLen, args);
+
+  if (dataPtr && dataLen) {
+    if (DEVICE_IS_I2C(device)) {
+      jshI2CWrite(device, (unsigned char)address, (int)dataLen, (unsigned char*)dataPtr, sendStop);
+    } else if (device == EV_NONE) {
+      // software
+      JshI2CInfo inf;
+      JsVar *options = jsvObjectGetChild(parent, DEVICE_OPTIONS_NAME, 0);
+      if (jsi2cPopulateI2CInfo(&inf, options)) {
+        inf.started = jsvGetBoolAndUnLock(jsvObjectGetChild(parent, "started", 0));
+        jsi2cWrite(&inf, (unsigned char)address, (int)dataLen, (unsigned char*)dataPtr, sendStop);
+      }
+      jsvUnLock2(jsvObjectSetChild(parent, "started", jsvNewFromBool(inf.started)), options);
+    }
   }
-
-  unsigned char *data = (unsigned char *)alloca(l);
-  jsvIterateCallbackToBytes(args, data, l);
-
-  jshI2CWrite(device, (unsigned char)address, l, data, sendStop);
 }
 
 /*JSON{
@@ -598,7 +623,6 @@ Request bytes from the given slave device, and return them as a Uint8Array (pack
  */
 JsVar *jswrap_i2c_readFrom(JsVar *parent, JsVar *addressVar, int nBytes) {
   IOEventFlags device = jsiGetDeviceFromClass(parent);
-  if (!DEVICE_IS_I2C(device)) return 0;
 
   bool sendStop = true;
   int address = i2c_get_address(addressVar, &sendStop);
@@ -611,7 +635,18 @@ JsVar *jswrap_i2c_readFrom(JsVar *parent, JsVar *addressVar, int nBytes) {
   }
   unsigned char *buf = (unsigned char *)alloca((size_t)nBytes);
 
-  jshI2CRead(device, (unsigned char)address, nBytes, buf, sendStop);
+  if (DEVICE_IS_I2C(device)) {
+    jshI2CRead(device, (unsigned char)address, nBytes, buf, sendStop);
+  } else if (device == EV_NONE) {
+    // software
+    JshI2CInfo inf;
+    JsVar *options = jsvObjectGetChild(parent, DEVICE_OPTIONS_NAME, 0);
+    if (jsi2cPopulateI2CInfo(&inf, options)) {
+      inf.started = jsvGetBoolAndUnLock(jsvObjectGetChild(parent, "started", 0));
+      jsi2cRead(&inf, (unsigned char)address, nBytes, buf, sendStop);
+    }
+    jsvUnLock2(jsvObjectSetChild(parent, "started", jsvNewFromBool(inf.started)), options);
+  } else return 0;
 
   JsVar *array = jsvNewTypedArray(ARRAYBUFFERVIEW_UINT8, nBytes);
   if (array) {

@@ -13,6 +13,7 @@
  * JavaScript methods and functions in the global namespace
  * ----------------------------------------------------------------------------
  */
+#include <math.h>
 #include "jswrap_functions.h"
 #include "jslex.h"
 #include "jsparse.h"
@@ -70,13 +71,14 @@ JsVar *jswrap_function_constructor(JsVar *args) {
     if (s) {
       // copy the string - if a string was supplied already we want to make
       // sure we have a new (unreferenced) string
-      JsVar *paramName = jsvNewFromStringVar(s, 0, JSVAPPENDSTRINGVAR_MAXLENGTH);
-      jsvUnLock(s);
+      JsVar *paramName = jsvNewFromString("\xFF");
       if (paramName) {
+        jsvAppendStringVarComplete(paramName, s);
         jsvMakeFunctionParameter(paramName); // force this to be called a function parameter
         jsvAddName(fn, paramName);
         jsvUnLock(paramName);
       }
+      jsvUnLock(s);
     }
 
     jsvUnLock(v);
@@ -84,10 +86,7 @@ JsVar *jswrap_function_constructor(JsVar *args) {
     jsvObjectIteratorNext(&it);
   }
   jsvObjectIteratorFree(&it);
-
-  JsVar *codeStr = jsvVarPrintf("{\n%v\n}", v);
-  jsvUnLock(v);
-  jsvObjectSetChildAndUnLock(fn, JSPARSE_FUNCTION_CODE_NAME, codeStr);
+  jsvObjectSetChildAndUnLock(fn, JSPARSE_FUNCTION_CODE_NAME, v);
   return fn;
 }
 
@@ -105,7 +104,7 @@ Evaluate a string containing JavaScript code
 JsVar *jswrap_eval(JsVar *v) {
   if (!v) return 0;
   JsVar *s = jsvAsString(v, false); // get as a string
-  JsVar *result = jspEvaluateVar(s, execInfo.thisVar, false);
+  JsVar *result = jspEvaluateVar(s, execInfo.thisVar, 0);
   jsvUnLock(s);
   return result;
 }
@@ -230,7 +229,7 @@ NO_INLINE static int jswrap_atob_decode(int c) {
   ],
   "return" : ["JsVar","A base64 encoded string"]
 }
-Convert the supplied string (or array) into a base64 string
+Encode the supplied string (or array) into a base64 string
  */
 JsVar *jswrap_btoa(JsVar *binaryData) {
   if (!jsvIsIterable(binaryData)) {
@@ -286,7 +285,7 @@ JsVar *jswrap_btoa(JsVar *binaryData) {
   ],
   "return" : ["JsVar","A string containing the decoded data"]
 }
-Convert the supplied base64 string into a base64 string
+Decode the supplied base64 string into a normal string
  */
 JsVar *jswrap_atob(JsVar *base64Data) {
   if (!jsvIsString(base64Data)) {
@@ -368,6 +367,56 @@ JsVar *jswrap_encodeURIComponent(JsVar *arg) {
         jsvStringIteratorAppend(&dst, (char)((d>9)?('A'+d-10):('0'+d)));
         d = ((unsigned)ch)&15;
         jsvStringIteratorAppend(&dst, (char)((d>9)?('A'+d-10):('0'+d)));
+      }
+      jsvStringIteratorNext(&it);
+    }
+    jsvStringIteratorFree(&dst);
+    jsvStringIteratorFree(&it);
+  }
+  jsvUnLock(v);
+  return result;
+}
+
+/*JSON{
+  "type" : "function",
+  "name" : "decodeURIComponent",
+  "ifndef" : "SAVE_ON_FLASH",
+  "generate" : "jswrap_decodeURIComponent",
+  "params" : [
+    ["str","JsVar","A string to decode from a URI"]
+  ],
+  "return" : ["JsVar","A string containing the decoded data"]
+}
+Convert any groups of characters of the form '%ZZ', into characters with hex code '0xZZ'
+ */
+JsVar *jswrap_decodeURIComponent(JsVar *arg) {
+  JsVar *v = jsvAsString(arg, false);
+  if (!v) return 0;
+  JsVar *result = jsvNewFromEmptyString();
+  if (result) {
+    JsvStringIterator it;
+    jsvStringIteratorNew(&it, v, 0);
+    JsvStringIterator dst;
+    jsvStringIteratorNew(&dst, result, 0);
+    while (jsvStringIteratorHasChar(&it)) {
+      char ch = jsvStringIteratorGetChar(&it);
+      if (ch>>7) {
+        jsExceptionHere(JSET_ERROR, "ASCII only\n");
+        break;
+      }
+      if (ch!='%') {
+        jsvStringIteratorAppend(&dst, ch);
+      } else {
+        jsvStringIteratorNext(&it);
+        int hi = chtod(jsvStringIteratorGetChar(&it));
+        jsvStringIteratorNext(&it);
+        int lo = chtod(jsvStringIteratorGetChar(&it));
+        ch = (char)((hi<<4)|lo);
+        if (hi<0 || lo<0 || ch>>7) {
+          jsExceptionHere(JSET_ERROR, "Invalid URI\n");
+          break;
+        }
+        jsvStringIteratorAppend(&dst, ch);
       }
       jsvStringIteratorNext(&it);
     }

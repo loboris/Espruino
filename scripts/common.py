@@ -83,13 +83,18 @@ if "check_output" not in dir( subprocess ):
 #
 
 
-def get_jsondata(is_for_document, parseArgs = True):
+def get_jsondata(is_for_document, parseArgs = True, board = False):
         scriptdir = os.path.dirname	(os.path.realpath(__file__))
         print("Script location "+scriptdir)
         os.chdir(scriptdir+"/..")
 
         jswraps = []
         defines = []
+
+        if board and ("build" in board.info)  and ("defines" in board.info["build"]):
+          for i in board.info["build"]["defines"]:
+            print("Got define from board: " + i);
+            defines.append(i)
 
         if parseArgs and len(sys.argv)>1:
           print("Using files from command line")
@@ -105,6 +110,8 @@ def get_jsondata(is_for_document, parseArgs = True):
                 if "i2c" in board.chip: defines.append("I2C_COUNT="+str(board.chip["i2c"]));
                 if "USB" in board.devices: defines.append("defined(USB)=True"); 
                 else: defines.append("defined(USB)=False");
+              elif arg[1]=="F":
+                "" # -Fxxx.yy in args is filename xxx.yy, which is mandatory for build_jswrapper.py
               else:
                 print("Unknown command-line option")
                 exit(1)
@@ -132,6 +139,8 @@ def get_jsondata(is_for_document, parseArgs = True):
             continue
 
           for comment in re.findall(r"/\*JSON.*?\*/", code, re.VERBOSE | re.MULTILINE | re.DOTALL):
+            charnumber = code.find(comment)
+            linenumber = 1+code.count("\n", 0, charnumber)
             # Strip off /*JSON .. */ bit
             comment = comment[6:-2]
 
@@ -144,6 +153,8 @@ def get_jsondata(is_for_document, parseArgs = True):
               if len(description): jsondata["description"] = description;
               jsondata["filename"] = jswrap
               jsondata["include"] = jswrap[:-2]+".h"
+              jsondata["githublink"] = "https://github.com/espruino/Espruino/blob/master/"+jswrap+"#L"+str(linenumber)
+
               dropped_prefix = "Dropped "
               if "name" in jsondata: dropped_prefix += jsondata["name"]+" "
               elif "class" in jsondata: dropped_prefix += jsondata["class"]+" "
@@ -302,10 +313,14 @@ def get_prefix_name(jsondata):
 
 def get_ifdef_description(d):
   if d=="SAVE_ON_FLASH": return "devices with low flash memory"
-  if d=="STM32F1": return "STM32F1 devices (including Espruino Board)"
+  if d=="STM32F1": return "STM32F1 devices (including Original Espruino Board)"
   if d=="USE_LCD_SDL": return "Linux with SDL support compiled in"
+  if d=="USE_TLS": return "devices with TLS and SSL support (Espruino Pico and Espruino WiFi only)"
   if d=="RELEASE": return "release builds"
   if d=="LINUX": return "Linux-based builds"
+  if d=="USE_USB_HID": return "devices that support USB HID (Espruino Pico and Espruino WiFi)"
+  if d=="USE_AES": return "devices that support AES (Espruino Pico, Espruino WiFi or Linux)"
+  if d=="USE_CRYPTO": return "devices that support Crypto Functionality (Espruino Pico, Espruino WiFi, Linux or ESP8266)"
   print("WARNING: Unknown ifdef '"+d+"' in common.get_ifdef_description")
   return d
 
@@ -313,11 +328,21 @@ def get_script_dir():
         return os.path.dirname(os.path.realpath(__file__))
 
 def get_version():
+        # Warning: the same release label derivation is also in the Makefile
         scriptdir = get_script_dir()
         jsutils = scriptdir+"/../src/jsutils.h"
         version = re.compile("^.*JS_VERSION.*\"(.*)\"");
-        latest_release = subprocess.check_output('git tag | grep RELEASE_ | sort | tail -1', shell=True).strip()
-        commits_since_release = subprocess.check_output('git log --oneline '+latest_release+'..HEAD | wc -l', shell=True).strip()
+        alt_release = os.getenv("ALT_RELEASE")
+        if alt_release == None:
+          # Default release labeling based on commits since last release tag
+          latest_release = subprocess.check_output('git tag | grep RELEASE_ | sort | tail -1', shell=True).strip()
+          commits_since_release = subprocess.check_output('git log --oneline '+latest_release.decode("utf-8")+'..HEAD | wc -l', shell=True).decode("utf-8").strip()
+        else:
+          # Alternate release labeling with fork name (in ALT_RELEASE env var) plus branch
+          # name plus commit SHA
+          sha = subprocess.check_output('git rev-parse --short HEAD', shell=True).strip()
+          branch = subprocess.check_output('git name-rev --name-only HEAD', shell=True).strip()
+          commits_since_release = alt_release + '_' + branch + '_' + sha
         for line in open(jsutils):
             match = version.search(line);
             if (match != None):

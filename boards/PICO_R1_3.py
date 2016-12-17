@@ -15,8 +15,9 @@
 
 import pinutils;
 info = {
- 'name' : "Espruino Pico rev 1.3",
+ 'name' : "Espruino Pico rev 1.3/1.4",
  'link' : [ "http://www.espruino.com/Pico" ],
+ 'espruino_page_link' : 'Pico',
  'default_console' : "EV_SERIAL1",
  'default_console_tx' : "B6",
  'default_console_rx' : "B7",
@@ -26,7 +27,19 @@ info = {
  'binaries' : [
   { 'filename' : 'espruino_%v_pico_1r3_wiznet.bin', 'description' : "WIZNet W5500 Ethernet Networking"},
   { 'filename' : 'espruino_%v_pico_1r3_cc3000.bin', 'description' : "TI CC3000 WiFi Networking"},
- ]
+ ],
+ 'build' : {
+   'defines' : [
+     'USE_USB_HID',
+     'USE_NET',
+     'USE_GRAPHICS',
+     'USE_TV',
+     'USE_HASHLIB',
+     'USE_FILESYSTEM',
+     'USE_CRYPTO',
+     'USE_TLS'
+   ]
+ }
 };
 chip = {
   'part' : "STM32F401CDU6",
@@ -44,18 +57,11 @@ chip = {
     'address' : 0x08004000,
     'page_size' : 16384, # size of pages
     'pages' : 3, # number of pages we're using
-    'flash_available' : 384 # binary will have a hole in it, so we just want to test against full size
+    'flash_available' : 384-64 # Saved code is before binary, test against full size minus offset
   },
   'place_text_section' : 0x00010000, # note flash_available above
 };
-# left-right, or top-bottom order
-board = {
-  'top' : [ 'BAT_IN','B15', 'B14', 'B13', 'B10', 'B1', 'A7', 'A6', 'A5' ], 
-  'bottom' : [ 'GND', 'VBAT', '3.3', 'B3', 'B4', 'B5', 'B6', 'B7','A8'],
 
-  'top2' : ['VBAT','3.3','GND'],
-  'right' : ['A4', 'A3', 'A2', 'A1', 'A0', 'A10', 'B9', 'B8'],
-};
 devices = {
   'OSC' : { 'pin_in' :  'H0', # checked
             'pin_out' : 'H1' }, # checked
@@ -75,7 +81,26 @@ devices = {
           }
 };
 
-board_css = """
+# left-right, or top-bottom order
+board = {
+  'top' : [ 'BAT_IN','B15', 'B14', 'B13', 'B10', 'B1', 'A7', 'A6', 'A5' ], 
+  'bottom' : [ 'GND', 'VBAT', '3.3', 'B3', 'B4', 'B5', 'B6', 'B7','A8'],
+
+  'top2' : ['VBAT','3.3','GND'],
+  'right' : ['A4', 'A3', 'A2', 'A1', 'A0', 'A10', 'B9', 'B8'],
+  '_notes' : {
+    'B6' : "Serial Console TX when USB disconnected, use `USB.setConsole(true)` to avoid",
+    'B7' : "Serial Console RX when USB disconnected, use `USB.setConsole(true)` to avoid",
+    'A9' : "Connected directly to USB 5V",
+    'A13' : "Accessible on row of gold SMD pads on underside",
+    'A14' : "Accessible on row of gold SMD pads on underside",
+    'A15' : "Accessible on row of gold SMD pads on underside",
+    'B0' : "Connected to FET when FET/B0 jumper shorted",
+    'C14' : "Connected to pads for optional 32kHz crystal",
+    'C15' : "Connected to pads for optional 32kHz crystal"
+  }
+};
+board["_css"] = """
 #board {
   width: 550px;
   height: 272px;
